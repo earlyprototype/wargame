@@ -4,6 +4,8 @@ An interactive political-military crisis simulation inspired by "The Wargame" po
 
 You are the Prime Minister of the United Kingdom. Russia has deployed an unprecedented naval force to the North Atlantic following a terrorist attack they falsely blame on Britain. Your decisions in the coming hours will determine whether the UK faces down this threat, stumbles into war, or appears weak before an adversary testing NATO's resolve.
 
+![Dialogue Demo](dialogue_demo.gif)
+
 ## Features
 
 - **Free-form Decision Making**: Describe any action you want to take - the game interprets and adjudicates it
