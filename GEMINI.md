@@ -26,7 +26,6 @@ The application is a turn-based narrative simulation engine with a modular archi
 
 -   **`engine/`**: The core of the game, this directory contains the main simulation logic.
     -   **`sim_loop.py`**: Contains the `Simulation` class, which manages the game state and turn progression.
-    -   **`adjudicator.py`**: Acts as the bridge between the game engine and the large language model (LLM). It uses the `ContextBuilder` to create a prompt from the current game state and sends it to the `GeminiClient`.
     -   **`actor_simulation.py`**: Simulates the behavior of non-player characters (NPCs) or state actors.
     -   **`scenario_loader.py`**: Loads game scenarios and actor profiles from YAML files in the `data/` directory.
 
