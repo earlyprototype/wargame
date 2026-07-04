@@ -15,6 +15,10 @@ You are the UK Prime Minister. Russia has just staged an attack and blamed Brita
 - **Consequences** — escalation risk, alliance cohesion, and domestic stability shift, the world state updates, and it carries into the next turn.
 - Play this out across a live, unscripted crisis with seven nations in the mix, until the UK faces the threat down, stumbles into war, or looks weak in front of an adversary testing NATO's resolve.
 
+Here's a full first turn, start to finish:
+
+![A complete turn: briefing, cabinet questions, a free-form decision, and adjudication](full_turn_demo.gif)
+
 ## Features
 
 - **Free-form Decision Making**: Describe any action you want to take - the game interprets and adjudicates it
