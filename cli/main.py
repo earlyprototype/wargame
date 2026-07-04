@@ -31,6 +31,7 @@ from cli.rich_ui import (
 )
 from cli.theme import theme_manager, COLORS, SYMBOLS, BOX, WIDTH
 from cli.formatters import format_advisor_response
+from rich.panel import Panel
 from models.world import WorldState, Metrics
 from models.narrative_state import NarrativeState, create_initial_narrative_state, PlayMode
 from models.narrative import NarrativeConfig
@@ -170,7 +171,6 @@ def display_decision_summary(action: str, interpretation: str, show_details: boo
     
     # Show player's exact words in a box
     console.print("")
-    from rich.panel import Panel
     console.print(Panel(f"[italic]{action}[/italic]", title="[bold]YOUR DECISION[/bold]", border_style="white"))
     console.print("")
     
@@ -223,7 +223,6 @@ def display_critical_concerns_with_selection(critical_concerns: list) -> tuple:
         action_code: 'A' (all), 'S' (select), 'M' (modify), 'I' (ignore), 'D' (discussion)
         selected_indices: List of 0-based indices of selected concerns
     """
-    from rich.panel import Panel
     COLORS = theme_manager.get_colors()
     
     console.print("")
@@ -1643,7 +1642,6 @@ def play(
                     enhanced_decision = append_recommendations_to_decision(action, critical_concerns, selected_indices)
                     
                     # Show enhanced decision
-                    from rich.panel import Panel
                     console.print(Panel(f"[italic]{enhanced_decision}[/italic]", title="[bold]ENHANCED DECISION[/bold]", border_style="white"))
                     console.print("")
                     
