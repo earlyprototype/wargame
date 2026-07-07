@@ -8,14 +8,14 @@ This module provides a persistent terminal UI with fixed zones:
 """
 
 from rich.layout import Layout
-from rich.live import Live
 from rich.panel import Panel
 from rich.table import Table
 from rich import box
-from typing import List
 
 class WargameDashboard:
     """Manages the persistent dashboard layout."""
+    MAX_LOG_MESSAGES = 100
+
     
     def __init__(self, world, console):
         """Initialize dashboard with world state and console.
@@ -144,7 +144,7 @@ class WargameDashboard:
         """
         # Show last 100 messages - much more capacity!
         if not self.conversation_log:
-            content = f"[dim]═══ COBRA COMMAND FEED ═══\n\nAwaiting intelligence...[/]"
+            content = "[dim]═══ COBRA COMMAND FEED ═══\n\nAwaiting intelligence...[/]"
         else:
             # Check if we have more messages than we're showing
             total_messages = len(self.conversation_log)
@@ -204,11 +204,13 @@ class WargameDashboard:
             formatted = f"[{self.COLORS['secondary']}]{speaker}:[/] {message}"
         
         self.conversation_log.append(formatted)
-        
-        # Keep log size manageable (max 200 messages for more history)
-        if len(self.conversation_log) > 200:
-            self.conversation_log = self.conversation_log[-200:]
+        self._trim_log()
     
+    def _trim_log(self):
+        """Keep the conversation log at most MAX_LOG_MESSAGES entries."""
+        if len(self.conversation_log) > self.MAX_LOG_MESSAGES:
+            self.conversation_log = self.conversation_log[-self.MAX_LOG_MESSAGES:]
+
     def stream_message(self, speaker: str, message: str, console, live, delay: float = 0.02):
         """Stream a message into the conversation log character by character.
         
@@ -238,6 +240,7 @@ class WargameDashboard:
                 self.conversation_log[-1] = current_line
             else:
                 self.conversation_log.append(current_line)
+                self._trim_log()
             
             # Refresh display
             self.update()
