@@ -370,7 +370,7 @@ def select_scenario_variant(scenario_id: str) -> str:
     console.print("")
     while True:
         try:
-            choice = typer.prompt("Select scenario (enter number)", type=int)
+            choice = typer.prompt("Select scenario (enter number)", type=int, default=1)
             if 1 <= choice <= len(scenarios):
                 selected_key = scenarios[choice - 1][0]
                 selected_name = scenarios[choice - 1][1].get("name", selected_key)
@@ -879,7 +879,10 @@ def play(
             get_player_input=lambda prompt: typer.prompt(prompt).strip(),
             turn_filename=turn_filename,
             silent_effects=is_turn1_intro or play_mode != "classic",  # Hide raw-number effect boxes for Turn 1 intro and non-classic modes
-            suppress_display=is_turn1_intro,  # Suppress panel so we can stream the text
+            # Always suppress the in-function panel: the screen is cleared right
+            # after this call and the briefing is streamed from the transcript,
+            # so the panel only ever produced a duplicate copy of every event.
+            suppress_display=True,
             replay=resume_replay  # Loaded mid-turn save: show briefing, don't re-apply it
         )
 
@@ -1006,7 +1009,7 @@ def play(
                 console.print(phase_header("DISCUSSION", world.turn))
                 typer.echo("")
                 typer.echo("  Ask questions or type /decide when ready")
-                console.print(f"  [{COLORS['muted']}]Quick: /status  /menu  /advise  /resources  /llm[/{COLORS['muted']}]")
+                console.print(f"  [{COLORS['muted']}]Quick: /status  /menu  /advise  /resources  /intel  /llm[/{COLORS['muted']}]")
                 typer.echo("")
                 console.print(f"[{COLORS['muted']}]" + "─" * 79 + f"[/{COLORS['muted']}]")
             else:
@@ -1063,7 +1066,7 @@ def play(
                             console.print(phase_header("DISCUSSION", world.turn))
                             typer.echo("")
                             typer.echo("  Ask questions or type /decide when ready")
-                            console.print(f"  [{COLORS['muted']}]Quick: /status  /menu  /advise  /resources  /llm[/{COLORS['muted']}]")
+                            console.print(f"  [{COLORS['muted']}]Quick: /status  /menu  /advise  /resources  /intel  /llm[/{COLORS['muted']}]")
                             typer.echo("")
                             console.print(f"[{COLORS['muted']}]" + "─" * 79 + f"[/{COLORS['muted']}]")
                     else:
@@ -1152,6 +1155,12 @@ def play(
                     typer.echo("")
                     continue
             
+                if user_input.lower() == "/call":
+                    # Bare /call: show usage instead of falling through to the LLM
+                    console.print(f"[{COLORS['warning']}]Usage: /call <country> — e.g. /call usa. See /menu for diplomatic contacts.[/{COLORS['warning']}]")
+                    typer.echo("")
+                    continue
+
                 if user_input.lower().startswith("/call "):
                     # Handle diplomatic call
                     country_input = user_input[6:].strip().upper()
@@ -1188,15 +1197,18 @@ def play(
                 
                     # Transcript already printed, just save it
                     transcript.extend(encounter_transcript)
-                
-                    # Apply alliance cohesion change
-                    from engine.utils import clamp, clamp_metrics
+
+                    # DiplomaticEncounter.end() already applied cohesion_delta;
+                    # applying it again here doubled every call outcome.
+                    from engine.utils import clamp_metrics
                     from engine.flags import update_world_flags
-                
-                    world.metrics.alliance_cohesion = clamp(world.metrics.alliance_cohesion + cohesion_delta)
+
                     clamp_metrics(world.metrics)
                     update_world_flags(world)
-                
+
+                    # Keep the narrative state in step with the call outcome
+                    narrative_state.hidden_metrics.alliance_cohesion = world.metrics.alliance_cohesion
+
                     continue
             
                 if user_input.lower() in ["/advise", "advise"]:
@@ -1568,9 +1580,11 @@ def play(
                         console.print(f"[{COLORS['primary']}]  /status[/{COLORS['primary']}]            - Show current metrics and situation")
                         console.print(f"[{COLORS['primary']}]  /advise[/{COLORS['primary']}]            - Get input from all advisors at once")
                         console.print(f"[{COLORS['primary']}]  /resources[/{COLORS['primary']}]         - Show UK forces and ammunition stockpiles")
+                        console.print(f"[{COLORS['primary']}]  /intel[/{COLORS['primary']}]             - Intelligence briefing on foreign actors")
                         console.print(f"[{COLORS['primary']}]  /call <country>[/{COLORS['primary']}]    - Contact a foreign leader or diplomat")
                         console.print(f"[{COLORS['primary']}]  /decide[/{COLORS['primary']}]            - Make your decision")
                         console.print(f"[{COLORS['primary']}]  /theme[/{COLORS['primary']}]             - Change UI theme")
+                        console.print(f"[{COLORS['primary']}]  /llm[/{COLORS['primary']}]               - Configure LLM model settings")
                         console.print(f"[{COLORS['primary']}]  /save[/{COLORS['primary']}]              - Save game and continue")
                         console.print(f"[{COLORS['primary']}]  /quit[/{COLORS['primary']}]              - Exit game")
                         typer.echo("")
@@ -1578,7 +1592,14 @@ def play(
                 
                     typer.echo("")
                     continue
-            
+
+                # Unknown slash-command: tell the player instead of sending it
+                # to the advisors as an in-fiction question (a paid LLM call)
+                if user_input.startswith("/"):
+                    console.print(f"[{COLORS['warning']}]Unknown command: {rich_escape(user_input.split()[0])} — type /menu for the command list.[/{COLORS['warning']}]")
+                    typer.echo("")
+                    continue
+
                 # Handle question
                 questions.append(user_input)
                 discussion_lines = run_turn_discussion(world, scenario, [user_input], rng, root, transcript)

@@ -471,6 +471,7 @@ def command_menu() -> Panel:
         ("/menu", "Display this help"),
         ("/advise", "Get input from all advisors"),
         ("/resources", "View UK forces and stockpiles"),
+        ("/intel", "Intelligence briefing on foreign actors"),
         ("/call <country>", "Contact foreign leader"),
         ("/decide", "Make your decision"),
         ("/theme", "Change UI color theme"),
