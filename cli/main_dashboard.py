@@ -61,15 +61,21 @@ app = typer.Typer(
 
 def scroll_text(text: str, delay: float = 0.03, allow_skip: bool = True) -> bool:
     """Print text character by character with optional skip.
-    
+
     Args:
         text: Text to scroll
         delay: Delay between characters (seconds)
         allow_skip: If True, pressing SPACE skips to end of scene
-        
+
     Returns:
         True if user pressed SPACE to skip, False otherwise
     """
+    # Non-interactive output (pipes, CI): the typewriter pacing is invisible
+    # there and its per-character sleeps dominate scripted-run wall time
+    if not sys.stdout.isatty():
+        print(text)
+        return False
+
     for i, char in enumerate(text):
         # Check if user pressed SPACE to skip rest of scene
         if allow_skip and key_pressed():
