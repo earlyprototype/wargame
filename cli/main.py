@@ -14,13 +14,11 @@ from typing import Optional
 import sys
 import os
 
-# CRITICAL: Import msvcrt FIRST on Windows (before Rich)
-if sys.platform == "win32":
-    pass
-
 # Allow running this file directly
 if __package__ is None or __package__ == "":
     sys.path.append(os.path.dirname(os.path.dirname(__file__)))
+
+from cli.keyboard import key_pressed, wait_for_key
 
 # THEN import Rich (after msvcrt is loaded)
 from cli.rich_ui import (
@@ -31,7 +29,11 @@ from cli.rich_ui import (
 )
 from cli.theme import theme_manager, SYMBOLS, BOX, WIDTH
 from cli.formatters import format_advisor_response
+# strip_effect_boxes is re-exported here for backwards compatibility
+# (external code may still do `from cli.main import strip_effect_boxes`).
+from cli.display_utils import strip_effect_boxes, display_adjudication_results
 from rich.panel import Panel
+from rich.markup import escape as rich_escape
 from models.world import WorldState, Metrics
 from models.narrative_state import create_initial_narrative_state
 from models.narrative import NarrativeConfig
@@ -45,6 +47,7 @@ from engine.sim_loop import (
 )
 from engine.narrative_adjudication import adjudicate_with_narrative
 from engine.intro import get_intro_lines
+from engine.endings import check_ending, build_debrief_lines, EPILOGUE_TURNS
 from engine.persistence import save_game, load_game
 from engine.initial_conditions import load_initial_conditions
 from engine.diplomacy import run_diplomatic_encounter, list_available_diplomatic_contacts
@@ -61,30 +64,30 @@ app = typer.Typer(
 
 def scroll_text(text: str, delay: float = 0.03, allow_skip: bool = True) -> bool:
     """Print text character by character with optional skip.
-    
+
     Args:
         text: Text to scroll
         delay: Delay between characters (seconds)
         allow_skip: If True, pressing SPACE skips to end of scene
-        
+
     Returns:
         True if user pressed SPACE to skip, False otherwise
     """
-    import msvcrt
-    import sys
-    
+    # Non-interactive output (pipes, CI): the typewriter pacing is invisible
+    # there and its per-character sleeps dominate scripted-run wall time
+    if not sys.stdout.isatty():
+        print(text)
+        return False
+
     for i, char in enumerate(text):
         # Check if user pressed SPACE to skip rest of scene
-        if allow_skip and msvcrt.kbhit():
-            key = msvcrt.getch()
-            if key == b' ':  # Spacebar
-                # Print rest of line and return skip signal
-                sys.stdout.write(text[i:])
-                sys.stdout.flush()
-                print()
-                return True  # Signal to skip rest of scene
-            # Ignore other keys, continue scrolling
-        
+        if allow_skip and key_pressed():
+            # Print rest of line and return skip signal
+            sys.stdout.write(text[i:])
+            sys.stdout.flush()
+            print()
+            return True  # Signal to skip rest of scene
+
         sys.stdout.write(char)
         sys.stdout.flush()
         
@@ -103,17 +106,9 @@ def scroll_text(text: str, delay: float = 0.03, allow_skip: bool = True) -> bool
     return False  # No skip
 
 
-def wait_for_space(prompt: str = "Press SPACE to continue...") -> None:
-    """Wait for user to press spacebar to continue."""
-    import msvcrt  # Windows-specific
-    typer.echo("")
-    typer.echo(prompt)
-    while True:
-        if msvcrt.kbhit():
-            key = msvcrt.getch()
-            if key == b' ':  # Spacebar
-                typer.echo("")
-                break
+def wait_for_space(prompt: str = "Press SPACE (or Enter) to continue...") -> None:
+    """Wait for the player to press spacebar (cross-platform)."""
+    wait_for_key(prompt)
 
 
 def parse_interpretation_simple(interpretation: str) -> dict:
@@ -171,7 +166,7 @@ def display_decision_summary(action: str, interpretation: str, show_details: boo
     
     # Show player's exact words in a box
     console.print("")
-    console.print(Panel(f"[italic]{action}[/italic]", title="[bold]YOUR DECISION[/bold]", border_style="white"))
+    console.print(Panel(f"[italic]{rich_escape(action)}[/italic]", title="[bold]YOUR DECISION[/bold]", border_style="white"))
     console.print("")
     
     if show_details:
@@ -233,9 +228,9 @@ def display_critical_concerns_with_selection(critical_concerns: list) -> tuple:
     
     # Display each concern with number
     for idx, (role, concern, recommendation) in enumerate(critical_concerns, 1):
-        console.print(f"[{COLORS['warning']} bold][{idx}] {role}[/{COLORS['warning']} bold]")
-        console.print(f"  {concern}")
-        console.print(f"  [{COLORS['primary']}]→ RECOMMENDATION: \"{recommendation}\"[/{COLORS['primary']}]")
+        console.print(f"[{COLORS['warning']} bold][{idx}] {rich_escape(role)}[/{COLORS['warning']} bold]")
+        console.print(f"  {rich_escape(concern)}")
+        console.print(f"  [{COLORS['primary']}]→ RECOMMENDATION: \"{rich_escape(recommendation)}\"[/{COLORS['primary']}]")
         console.print("")
         console.print(f"[{COLORS['muted']}]" + "─" * 40 + f"[/{COLORS['muted']}]")
         console.print("")
@@ -360,7 +355,7 @@ def select_scenario_variant(scenario_id: str) -> str:
     console.print("")
     while True:
         try:
-            choice = typer.prompt("Select scenario (enter number)", type=int)
+            choice = typer.prompt("Select scenario (enter number)", type=int, default=1)
             if 1 <= choice <= len(scenarios):
                 selected_key = scenarios[choice - 1][0]
                 selected_name = scenarios[choice - 1][1].get("name", selected_key)
@@ -639,7 +634,10 @@ def play(
     if variant is None and load_save is None:
         variant = select_scenario_variant(scenario)
     elif variant is None:
-        variant = "standard"  # Default for loaded games
+        # Restore the variant the save was created with (old saves default to
+        # "standard") so Fast Start games resume with the right turn files
+        from engine.persistence import read_save_variant
+        variant = read_save_variant(Path(load_save))
     
     # If no play mode specified and not loading a save, show selection menu
     if play_mode is None and load_save is None:
@@ -731,7 +729,7 @@ def play(
             
             # Pause after each scene
             typer.echo("")
-            wait_for_space("Press SPACE to continue...")
+            wait_for_space("Press SPACE (or Enter) to continue...")
         
         typer.echo("")
     
@@ -746,6 +744,8 @@ def play(
     first_briefing_as_intro = (load_save is None)
     
     # Load or create world state
+    resume_replay = False  # True when a loaded save already ran this turn's briefing
+    loaded_initial_metrics = None  # Campaign-start metrics persisted in the save
     if load_save:
         save_path = Path(load_save)
         try:
@@ -753,9 +753,18 @@ def play(
             # Use loaded play_mode if available, otherwise use command-line arg
             if loaded_play_mode:
                 play_mode = loaded_play_mode
+            # Campaign-start snapshot (2.2+ saves); old saves fall back to
+            # the resume point's metrics below.
+            from engine.persistence import read_save_field
+            loaded_initial_metrics = read_save_field(save_path, "initial_metrics")
             typer.echo(f"Loaded game from {save_path}")
             typer.echo(f"Resuming at Turn {world.turn}")
             typer.echo("")
+
+            # If the save was taken mid-turn (after the briefing ran), the
+            # first briefing must replay for context WITHOUT re-applying its
+            # effects or re-running its mandatory diplomatic encounter.
+            resume_replay = world.phase in ("discussion", "decision", "adjudication")
             
             # Use loaded narrative state if available, otherwise create new
             if loaded_narrative_state:
@@ -815,7 +824,19 @@ def play(
     # Load scenario configuration for variant-specific turn files
     scenario_config = get_scenario_config(scenario, variant, root)
     stochastic_from_turn = scenario_config.get("stochastic_from", 7)
-    
+
+    # Classic-mode campaign grading: thresholds can end the game on any turn,
+    # and the campaign is graded after the scripted turns plus a short
+    # stochastic epilogue. Deltas in the debrief measure from the campaign
+    # start (persisted in saves; old saves fall back to the resume point).
+    campaign_final_turn = (stochastic_from_turn - 1) + scenario_config.get("epilogue_turns", EPILOGUE_TURNS)
+    endings_disabled = False
+    initial_metrics_snapshot = loaded_initial_metrics or {
+        "escalation_risk": world.metrics.escalation_risk,
+        "domestic_stability": world.metrics.domestic_stability,
+        "alliance_cohesion": world.metrics.alliance_cohesion,
+    }
+
     # Main game loop
     while True:
         # Refresh colors at start of loop in case theme changed
@@ -838,7 +859,7 @@ def play(
                 console.print("The scripted scenario has concluded. From this point forward,")
                 console.print("events will be dynamically generated based on your decisions.")
                 console.print("")
-                wait_for_space("Press SPACE to continue...")
+                wait_for_space("Press SPACE (or Enter) to continue...")
                 console.print("")
         
         # Determine if we should use stochastic generation for this turn
@@ -851,18 +872,45 @@ def play(
         # For Turn 1 of new games: suppress panel display and effect boxes (will be streamed in intro flow)
         is_turn1_intro = (first_briefing_as_intro and world.turn == 1)
         inject, briefing_lines = run_turn_briefing(
-            world, 
-            scenario, 
-            use_stochastic, 
-            rng, 
-            root, 
+            world,
+            scenario,
+            use_stochastic,
+            rng,
+            root,
             transcript,
             get_player_input=lambda prompt: typer.prompt(prompt).strip(),
             turn_filename=turn_filename,
-            silent_effects=is_turn1_intro,  # Hide effect boxes for Turn 1 intro
-            suppress_display=is_turn1_intro  # Suppress panel so we can stream the text
+            silent_effects=is_turn1_intro or play_mode != "classic",  # Hide raw-number effect boxes for Turn 1 intro and non-classic modes
+            # Always suppress the in-function panel: the screen is cleared right
+            # after this call and the briefing is streamed from the transcript,
+            # so the panel only ever produced a duplicate copy of every event.
+            suppress_display=True,
+            replay=resume_replay  # Loaded mid-turn save: show briefing, don't re-apply it
         )
+
+        if not resume_replay:
+            # Sync inject effects into the narrative state. Adjudication mutates
+            # narrative_state.hidden_metrics and the result is copied back over
+            # world.metrics at end of turn, so any briefing effect left only on
+            # world.metrics would be silently reverted. This also snapshots
+            # previous_metrics, giving the immersive-mode vibes a real trend baseline.
+            narrative_state.update_hidden_metrics({
+                "escalation_risk": world.metrics.escalation_risk,
+                "domestic_stability": world.metrics.domestic_stability,
+                "alliance_cohesion": world.metrics.alliance_cohesion,
+                "casualties_mil": world.metrics.casualties_mil,
+                "casualties_civ": world.metrics.casualties_civ,
+            })
+        resume_replay = False  # Only the first briefing after a load is a replay
         
+        # Non-classic modes hide raw metric numbers: strip the effect boxes from
+        # the on-screen briefing. They stay in `briefing_lines`/the transcript,
+        # which feeds saves and LLM context.
+        if play_mode != "classic":
+            briefing_display = strip_effect_boxes(briefing_lines)
+        else:
+            briefing_display = briefing_lines
+
         # Clear screen and display briefing at top
         # BUT: if this is Turn 1 of a new game, don't clear (flows from intro)
         if not (first_briefing_as_intro and world.turn == 1):
@@ -872,20 +920,20 @@ def play(
             typer.echo("")
             typer.echo("=" * 79)
             typer.echo("")
-        
+
         # Split briefing into scene-setting and actual briefing
         # Look for "The National Security Advisor" or similar transition line
         # BUT: for Turn 1 of new games, don't split - show everything in one flow
         scene_setting_end = -1
         if not (first_briefing_as_intro and world.turn == 1):
-            for i, line in enumerate(briefing_lines):
+            for i, line in enumerate(briefing_display):
                 if "National Security Advisor" in line and ("clears" in line or "begins" in line):
                     scene_setting_end = i
                     break
-        
+
         # Display scene-setting part with streaming
         skip_rest = False
-        for i, line in enumerate(briefing_lines):
+        for i, line in enumerate(briefing_display):
             # Stop at the transition line
             if scene_setting_end > 0 and i >= scene_setting_end:
                 break
@@ -923,12 +971,12 @@ def play(
         # Pause after scene-setting (only if we found a split point)
         if scene_setting_end > 0:
             typer.echo("")
-            wait_for_space("Press SPACE to continue...")
+            wait_for_space("Press SPACE (or Enter) to continue...")
             
             # Display rest of briefing (the actual intelligence report)
             typer.echo("")
-            for i in range(scene_setting_end, len(briefing_lines)):
-                typer.echo(briefing_lines[i])
+            for i in range(scene_setting_end, len(briefing_display)):
+                typer.echo(briefing_display[i])
         
         transcript.extend(briefing_lines)
         
@@ -943,767 +991,788 @@ def play(
         
         # Pause before discussion phase
         typer.echo("")
-        wait_for_space("Press SPACE to begin discussion phase...")
+        wait_for_space("Press SPACE (or Enter) to begin discussion phase...")
         
         # After Turn 1 intro briefing is shown, reset the flag
         if first_briefing_as_intro and world.turn == 1:
             first_briefing_as_intro = False
         
-        # Clear screen and show discussion phase at top
-        typer.clear()
-        typer.echo("")  # Buffer line BEFORE Rich output
+        # Discussion + decision phase loop: cancelling a decision returns to
+        # discussion WITHOUT re-running the briefing (which would re-apply
+        # inject effects and replay mandatory diplomatic encounters).
+        decision_confirmed = False
+        while not decision_confirmed:
+            world.phase = "discussion"  # A save from here on resumes as a replay
+            # Clear screen and show discussion phase at top
+            typer.clear()
+            typer.echo("")  # Buffer line BEFORE Rich output
         
-        if RICH_ENABLED:
-            console.print(phase_header("DISCUSSION", world.turn))
-            typer.echo("")
-            typer.echo("  Ask questions or type /decide when ready")
-            console.print(f"  [{COLORS['muted']}]Quick: /status  /menu  /advise  /resources  /llm[/{COLORS['muted']}]")
-            typer.echo("")
-            console.print(f"[{COLORS['muted']}]" + "─" * 79 + f"[/{COLORS['muted']}]")
-        else:
-            console.print("=" * 79)
-            console.print(f"[{COLORS['accent']} bold]TURN {world.turn}: DISCUSSION PHASE[/{COLORS['accent']} bold]")
-            console.print("=" * 79)
-            console.print("")
-            console.print("Ask advisors questions, or type '/decide' when ready.")
-            console.print("Type '/menu' for commands, '/advise' for all advisors, '/resources' for forces.")
-        
-        typer.echo("")
-        
-        # Discussion phase loop
-        questions = []
-        while True:
-            user_input = typer.prompt(">").strip()
-            
-            if not user_input:
-                continue
-            
-            # Handle commands
-            if user_input.lower() in ["/decide", "decide", "decision"]:
-                break
-            
-            if user_input.lower() in ["/quit", "quit"]:
-                typer.echo("Exiting game.")
-                raise typer.Exit(0)
-            
-            if user_input.lower() in ["/save", "save"]:
-                save_path = save_game(world, transcript, scenario, f"turn_{world.turn:03d}", root, play_mode, narrative_state)
-                typer.echo(f"Game saved to {save_path}")
-                continue
-            
-            if user_input.lower() in ["/theme", "theme"]:
+            if RICH_ENABLED:
+                console.print(phase_header("DISCUSSION", world.turn))
                 typer.echo("")
-                console.print("Available themes:")
-                console.print("  1. Standard (Cyan/Blue)")
-                console.print("  2. DEFCON 1 (Red/Alert)")
-                console.print("  3. Retro (Green Phosphor)")
-                console.print("  4. Slate (Black/White Monochrome)")
+                typer.echo("  Ask questions or type /decide when ready")
+                console.print(f"  [{COLORS['muted']}]Quick: /status  /menu  /advise  /resources  /intel  /llm[/{COLORS['muted']}]")
                 typer.echo("")
+                console.print(f"[{COLORS['muted']}]" + "─" * 79 + f"[/{COLORS['muted']}]")
+            else:
+                console.print("=" * 79)
+                console.print(f"[{COLORS['accent']} bold]TURN {world.turn}: DISCUSSION PHASE[/{COLORS['accent']} bold]")
+                console.print("=" * 79)
+                console.print("")
+                console.print("Ask advisors questions, or type '/decide' when ready.")
+                console.print("Type '/menu' for commands, '/advise' for all advisors, '/resources' for forces.")
+        
+            typer.echo("")
+        
+            # Discussion phase loop
+            questions = []
+            while True:
+                user_input = typer.prompt(">").strip()
+            
+                if not user_input:
+                    continue
+            
+                # Handle commands
+                if user_input.lower() in ["/decide", "decide", "decision"]:
+                    break
+            
+                if user_input.lower() in ["/quit", "quit"]:
+                    typer.echo("Exiting game.")
+                    raise typer.Exit(0)
+            
+                if user_input.lower() in ["/save", "save"]:
+                    save_path = save_game(world, transcript, scenario, f"turn_{world.turn:03d}", root, play_mode, narrative_state, variant=variant, initial_metrics=initial_metrics_snapshot)
+                    typer.echo(f"Game saved to {save_path}")
+                    continue
+            
+                if user_input.lower() in ["/theme", "theme"]:
+                    typer.echo("")
+                    console.print("Available themes:")
+                    console.print("  1. Standard (Cyan/Blue)")
+                    console.print("  2. DEFCON 1 (Red/Alert)")
+                    console.print("  3. Retro (Green Phosphor)")
+                    console.print("  4. Slate (Black/White Monochrome)")
+                    typer.echo("")
                 
-                theme_choice = typer.prompt("Select theme (1-4)").strip()
-                theme_map = {"1": "standard", "2": "defcon1", "3": "retro", "4": "slate"}
+                    theme_choice = typer.prompt("Select theme (1-4)").strip()
+                    theme_map = {"1": "standard", "2": "defcon1", "3": "retro", "4": "slate"}
                 
-                if theme_choice in theme_map:
-                    theme_name = theme_map[theme_choice]
-                    theme_manager.set_theme(theme_name)
-                    COLORS = theme_manager.get_colors()
-                    console.print(f"[{COLORS['success']}]Theme changed to {theme_name.title()}[/{COLORS['success']}]")
-                    # Refresh current view
+                    if theme_choice in theme_map:
+                        theme_name = theme_map[theme_choice]
+                        theme_manager.set_theme(theme_name)
+                        COLORS = theme_manager.get_colors()
+                        console.print(f"[{COLORS['success']}]Theme changed to {theme_name.title()}[/{COLORS['success']}]")
+                        # Refresh current view
+                        typer.clear()
+                        if RICH_ENABLED:
+                            console.print(phase_header("DISCUSSION", world.turn))
+                            typer.echo("")
+                            typer.echo("  Ask questions or type /decide when ready")
+                            console.print(f"  [{COLORS['muted']}]Quick: /status  /menu  /advise  /resources  /intel  /llm[/{COLORS['muted']}]")
+                            typer.echo("")
+                            console.print(f"[{COLORS['muted']}]" + "─" * 79 + f"[/{COLORS['muted']}]")
+                    else:
+                        console.print("[bold red]Invalid selection[/bold red]")
+                    continue
+
+                if user_input.lower() in ["/status", "status"]:
+                    typer.echo("")
+                
+                    if RICH_ENABLED:
+                        # Display based on play mode
+                        if play_mode == "classic":
+                            # Show metrics table (includes turn, phase, influence)
+                            console.print(metrics_table(world))
+                        elif play_mode == "immersive":
+                            # Show vibes
+                            typer.echo("═" * 60)
+                            typer.echo("SITUATION ASSESSMENT")
+                            typer.echo("═" * 60)
+                            typer.echo("")
+                            vibes = narrative_state.get_situation_vibes()
+                            for vibe in vibes:
+                                typer.echo(vibe.to_string())
+                            typer.echo("")
+                        
+                            # Show character attitudes
+                            typer.echo("═" * 60)
+                            typer.echo("ADVISOR ATTITUDES")
+                            typer.echo("═" * 60)
+                            typer.echo("")
+                            for char_id, char_attitude in narrative_state.characters.items():
+                                trust_level = char_attitude.trust // 20
+                                trust_bar = "█" * trust_level + "░" * (5 - trust_level)
+                                relationship_symbol = {
+                                    "allied": "✓",
+                                    "neutral": "○",
+                                    "hostile": "✗",
+                                    "unknown": "?"
+                                }.get(char_attitude.relationship, "○")
+                                typer.echo(f"{char_attitude.name:<30} {trust_bar} {relationship_symbol} {char_attitude.relationship.upper()}")
+                        elif play_mode == "emergent":
+                            # Show narrative summary
+                            typer.echo("═" * 60)
+                            typer.echo(narrative_state.situation_summary)
+                            typer.echo("═" * 60)
+                    
+                        # Show active flags if any
+                        if world.flags:
+                            typer.echo("")
+                            console.print(f"[{COLORS['warning']} bold]ACTIVE RISK FLAGS:[/{COLORS['warning']} bold]")
+                            for flag, value in world.flags.items():
+                                if value:
+                                    console.print(f"  [{COLORS['warning']}]{SYMBOLS['warning']} {flag.replace('_', ' ').title()}[/{COLORS['warning']}]")
+                    else:
+                        # Fallback to plain text
+                        typer.echo("=" * 60)
+                        typer.echo("CURRENT SITUATION")
+                        typer.echo("=" * 60)
+                        typer.echo("")
+                        typer.echo(f"Turn: {world.turn}")
+                        typer.echo(f"Phase: {world.phase}")
+                        typer.echo("")
+                        typer.echo("Metrics:")
+                        typer.echo(f"  Escalation Risk:      {world.metrics.escalation_risk}/100")
+                        typer.echo(f"  Domestic Stability:   {world.metrics.domestic_stability}/100")
+                        typer.echo(f"  Alliance Cohesion:    {world.metrics.alliance_cohesion}/100")
+                        typer.echo(f"  Military Casualties:  {world.metrics.casualties_mil}")
+                        typer.echo(f"  Civilian Casualties:  {world.metrics.casualties_civ}")
+                        typer.echo("")
+                    
+                        # Calculate influence
+                        influence_raw = (world.metrics.domestic_stability + world.metrics.alliance_cohesion) / 2.0
+                        influence = int((influence_raw - 50) / 5)
+                        influence = max(-10, min(10, influence))
+                        influence_sign = "+" if influence >= 0 else ""
+                        typer.echo(f"Public Sentiment (Influence): {influence_sign}{influence}/10")
+                        typer.echo("")
+                    
+                        if world.flags:
+                            typer.echo("Active Risk Flags:")
+                            for flag, value in world.flags.items():
+                                if value:
+                                    typer.echo(f"  ! {flag.replace('_', ' ').title()}")
+                            typer.echo("")
+                
+                    typer.echo("")
+                    continue
+            
+                if user_input.lower() == "/call":
+                    # Bare /call: show usage instead of falling through to the LLM
+                    console.print(f"[{COLORS['warning']}]Usage: /call <country> — e.g. /call usa. See /menu for diplomatic contacts.[/{COLORS['warning']}]")
+                    typer.echo("")
+                    continue
+
+                if user_input.lower().startswith("/call "):
+                    # Handle diplomatic call
+                    country_input = user_input[6:].strip().upper()
+                
+                    # Map common names to country codes
+                    country_map = {
+                        "US": "US", "USA": "US", "AMERICA": "US", "UNITED STATES": "US",
+                        "FRANCE": "France", "FRENCH": "France",
+                        "GERMANY": "Germany", "GERMAN": "Germany",
+                        "POLAND": "Poland", "POLISH": "Poland",
+                        "RUSSIA": "Russia", "RUSSIAN": "Russia",
+                        "UKRAINE": "Ukraine", "UKRAINIAN": "Ukraine",
+                        "IRELAND": "Ireland", "IRISH": "Ireland"
+                    }
+                
+                    country = country_map.get(country_input, country_input.capitalize())
+                
+                    console.print("")
+                    console.print(f"[{COLORS['success']} bold]Connecting to {country}...[/{COLORS['success']} bold]")
+                
+                    # Run diplomatic encounter (with real-time printing)
+                    encounter_transcript, cohesion_delta = run_diplomatic_encounter(
+                        world,
+                        country,
+                        required=False,
+                        context=None,
+                        llm_generate=generate_text,
+                        rng=rng,
+                        root_path=root,
+                        full_transcript=transcript,
+                        get_player_input=lambda prompt: typer.prompt(prompt).strip(),
+                        print_fn=typer.echo  # Print in real-time
+                    )
+                
+                    # Transcript already printed, just save it
+                    transcript.extend(encounter_transcript)
+
+                    # DiplomaticEncounter.end() already applied cohesion_delta;
+                    # applying it again here doubled every call outcome.
+                    from engine.utils import clamp_metrics
+                    from engine.flags import update_world_flags
+
+                    clamp_metrics(world.metrics)
+                    update_world_flags(world)
+
+                    # Keep the narrative state in step with the call outcome
+                    narrative_state.hidden_metrics.alliance_cohesion = world.metrics.alliance_cohesion
+
+                    continue
+            
+                if user_input.lower() in ["/advise", "advise"]:
+                    # Get advice from all advisors
+                    typer.echo("")
+                
+                    if RICH_ENABLED:
+                        # Top border
+                        box = BOX["round"]
+                        title = " COBRA ADVISORY PANEL "
+                        title_len = len(title)
+                        left_pad = (WIDTH - title_len - 2) // 2
+                        right_pad = WIDTH - title_len - left_pad - 2
+                        console.print(f"[{COLORS['accent']} bold]{box['tl']}{box['h'] * left_pad}{title}{box['h'] * right_pad}{box['tr']}[/{COLORS['accent']} bold]")
+                        typer.echo("")
+                    else:
+                        typer.echo("=" * 79)
+                        typer.echo("COBRA ADVISORY PANEL")
+                        typer.echo("=" * 79)
+                        typer.echo("")
+                
+                    typer.echo("Requesting input from all advisors on the current situation...")
+                    typer.echo("")
+                
+                    # Ask each advisor for their assessment
+                    # Add conciseness instruction to keep responses brief
+                    advisors = [
+                        ("National Security Advisor", "NSA, what's your assessment of the current situation and recommended course of action? [Please be concise - 3-4 sentences maximum]"),
+                        ("Chief of the Defence Staff", "CDS, what are our military options and constraints? [Please be concise - 3-4 sentences maximum]"),
+                        ("Foreign Secretary", "Foreign Secretary, what's the diplomatic landscape and alliance status? [Please be concise - 3-4 sentences maximum]"),
+                        ("Home Secretary", "Home Secretary, what are the domestic security concerns? [Please be concise - 3-4 sentences maximum]"),
+                        ("Attorney General", "Attorney General, what are the legal constraints and considerations? [Please be concise - 3-4 sentences maximum]")
+                    ]
+                
+                    for advisor_name, question in advisors:
+                        # Separator between advisors
+                        if RICH_ENABLED:
+                            console.print(f"[{COLORS['muted']}]" + "─" * 79 + f"[/{COLORS['muted']}]")
+                        else:
+                            typer.echo("─" * 79)
+                    
+                        console.print(f"  [{COLORS['secondary']} bold]{advisor_name.upper()}[/{COLORS['secondary']} bold]")
+                        typer.echo("")
+                    
+                        # Get response from this advisor
+                        discussion_lines = run_turn_discussion(world, scenario, [question], rng, root, transcript)
+                        for line in discussion_lines:
+                            # Skip the "Prime Minister:" echo and strip the conciseness instruction
+                            if not line.startswith("Prime Minister:"):
+                                # Remove the [Please be concise...] instruction from display
+                                display_line = line.replace("[Please be concise - 3-4 sentences maximum]", "").strip()
+                                if display_line:  # Only display non-empty lines
+                                    # Format response with structure
+                                    if ":" in display_line:
+                                        advisor_role, rest = display_line.split(":", 1)
+                                        if RICH_ENABLED:
+                                            formatted = format_advisor_response("", rest)
+                                            console.print(formatted)
+                                        else:
+                                            console.print(f"[{COLORS['secondary']} bold]{advisor_role}:[/{COLORS['secondary']} bold]", end="")
+                                            console.print(rest)
+                                    else:
+                                        typer.echo(display_line)
+                            else:
+                                # For transcript, clean up the question
+                                clean_line = line.replace("[Please be concise - 3-4 sentences maximum]", "").strip()
+                                transcript.append(clean_line)
+                                continue
+                        # Only add non-question lines to transcript (questions already added above)
+                        transcript.extend([l for l in discussion_lines if not l.startswith("Prime Minister:")])
+                        typer.echo("")
+                
+                    if RICH_ENABLED:
+                        # Bottom border
+                        console.print(f"[{COLORS['accent']} bold]{box['bl']}{box['h'] * (WIDTH - 2)}{box['br']}[/{COLORS['accent']} bold]")
+                    else:
+                        typer.echo("=" * 79)
+                
+                    typer.echo("")
+                    continue
+            
+                if user_input.lower() in ["/resources", "resources"]:
+                    # Display UK forces and stockpiles
+                    initial_conditions = load_initial_conditions(scenario, root)
+                
+                    typer.echo("")
+                
+                    if RICH_ENABLED:
+                        forces_table, stockpiles_table = resources_tables(initial_conditions)
+                        console.print(forces_table)
+                        typer.echo("")
+                        console.print(stockpiles_table)
+                        typer.echo("")
+                        continue
+                
+                    # Fallback to plain text
+                    typer.echo("=" * 79)
+                    typer.echo("UK MILITARY RESOURCES")
+                    typer.echo("=" * 79)
+                    typer.echo("")
+                
+                    # Display stockpiles
+                    stockpiles = initial_conditions.get("stockpiles", {})
+                    if stockpiles:
+                        typer.echo("AMMUNITION STOCKPILES:")
+                        typer.echo("")
+                    
+                        # Air Defence
+                        air_defence = stockpiles.get("air_defence_missiles", {})
+                        if air_defence:
+                            typer.echo("  Air Defence:")
+                            for weapon, data in air_defence.items():
+                                count = data.get("count", 0)
+                                note = data.get("note", "")
+                                typer.echo(f"    • {weapon.replace('_', ' ').title()}: {count}")
+                                if note:
+                                    typer.echo(f"      {note}")
+                            typer.echo("")
+                    
+                        # Naval Strike
+                        typer.echo("  Naval Strike:")
+                        tomahawk = stockpiles.get("tomahawk_cruise_missiles", {})
+                        if tomahawk:
+                            typer.echo(f"    • Tomahawk Cruise Missiles: {tomahawk.get('count', 0)}")
+                            typer.echo(f"      {tomahawk.get('note', '')}")
+                        harpoon = stockpiles.get("harpoon_anti_ship", {})
+                        if harpoon:
+                            typer.echo(f"    • Harpoon Anti-Ship: {harpoon.get('count', 0)}")
+                            typer.echo(f"      {harpoon.get('note', '')}")
+                        typer.echo("")
+                    
+                        # Air-Launched
+                        typer.echo("  Air-Launched Precision:")
+                        storm_shadow = stockpiles.get("storm_shadow_cruise_missiles", {})
+                        if storm_shadow:
+                            typer.echo(f"    • Storm Shadow: {storm_shadow.get('count', 0)}")
+                            typer.echo(f"      {storm_shadow.get('note', '')}")
+                        paveway = stockpiles.get("paveway_laser_guided_bombs", {})
+                        if paveway:
+                            typer.echo(f"    • Paveway LGBs: {paveway.get('count', 0)}")
+                            typer.echo(f"      {paveway.get('note', '')}")
+                        typer.echo("")
+                    
+                        # Anti-Submarine
+                        typer.echo("  Anti-Submarine:")
+                        spearfish = stockpiles.get("spearfish_torpedoes", {})
+                        if spearfish:
+                            typer.echo(f"    • Spearfish Torpedoes: {spearfish.get('count', 0)}")
+                            typer.echo(f"      {spearfish.get('note', '')}")
+                        stingray = stockpiles.get("stingray_lightweight_torpedoes", {})
+                        if stingray:
+                            typer.echo(f"    • Stingray Torpedoes: {stingray.get('count', 0)}")
+                            typer.echo(f"      {stingray.get('note', '')}")
+                        typer.echo("")
+                
+                    # Display forces
+                    uk_forces = initial_conditions.get("uk_forces", {})
+                    if uk_forces:
+                        naval = uk_forces.get("naval", [])
+                        if naval:
+                            typer.echo("NAVAL FORCES:")
+                            typer.echo("")
+                            for unit in naval:
+                                unit_id = unit.get("id", "Unknown")
+                                unit_type = unit.get("type", "")
+                                location = unit.get("location", "")
+                                status = unit.get("status", "")
+                                typer.echo(f"  • {unit_id} ({unit_type})")
+                                typer.echo(f"    Location: {location}")
+                                typer.echo(f"    Status: {status}")
+                                if unit.get("note"):
+                                    typer.echo(f"    Note: {unit.get('note')}")
+                                typer.echo("")
+                    
+                        air = uk_forces.get("air", [])
+                        if air:
+                            typer.echo("AIR FORCES:")
+                            typer.echo("")
+                            for unit in air:
+                                unit_id = unit.get("id", "Unknown")
+                                unit_type = unit.get("type", "")
+                                location = unit.get("location", "")
+                                status = unit.get("status", "")
+                            
+                                # Display unit header
+                                typer.echo(f"  • {unit_id}")
+                            
+                                # Show type and role
+                                if unit_type:
+                                    role = unit.get("role", "")
+                                    if role:
+                                        typer.echo(f"    Type: {unit_type} ({role})")
+                                    else:
+                                        typer.echo(f"    Type: {unit_type}")
+                            
+                                # Show location if present
+                                if location:
+                                    typer.echo(f"    Location: {location}")
+                            
+                                # Show aircraft counts if present
+                                aircraft_count = unit.get("aircraft_count")
+                                operational_aircraft = unit.get("operational_aircraft")
+                                if aircraft_count is not None:
+                                    if operational_aircraft is not None:
+                                        typer.echo(f"    Aircraft: {operational_aircraft}/{aircraft_count} operational")
+                                    else:
+                                        typer.echo(f"    Aircraft: {aircraft_count}")
+                            
+                                # Show status
+                                typer.echo(f"    Status: {status}")
+                            
+                                # Show note if present
+                                if unit.get("note"):
+                                    typer.echo(f"    Note: {unit.get('note')}")
+                            
+                                typer.echo("")
+                
+                    typer.echo("=" * 79)
+                    typer.echo("")
+                    continue
+            
+                if user_input.lower().startswith("/intel"):
+                    # Intelligence command - detailed actor assessment
+                    typer.echo("")
+                
+                    # Parse command: /intel or /intel <country_code>
+                    parts = user_input.lower().split()
+                    if len(parts) == 1:
+                        # Show available actors
+                        if world.actor_system:
+                            typer.echo("Available countries for intelligence assessment:")
+                            typer.echo("")
+                            for code, actor in world.actor_system.actors.items():
+                                typer.echo(f"  /intel {code.lower()} - {actor.full_name}")
+                            typer.echo("")
+                        else:
+                            typer.echo("Intelligence system not available.")
+                    else:
+                        # Show detailed assessment for specific actor
+                        country_code = parts[1].upper()
+                        if world.actor_system:
+                            from engine.intelligence import generate_actor_detailed_assessment
+                            intel_lines = generate_actor_detailed_assessment(country_code, world, world.turn)
+                            for line in intel_lines:
+                                console.print(line)
+                        else:
+                            typer.echo("Intelligence system not available.")
+                
+                    typer.echo("")
+                    continue
+            
+                if user_input.lower() in ["/llm", "llm", "/settings", "settings"]:
+                    # Open LLM model settings menu
+                    typer.echo("")
+                    typer.echo("Opening LLM Model Settings...")
+                    typer.echo("")
+                    model_settings_menu()
+                    # After returning from settings, clear and redisplay the discussion phase
                     typer.clear()
+                    typer.echo("")
                     if RICH_ENABLED:
                         console.print(phase_header("DISCUSSION", world.turn))
                         typer.echo("")
                         typer.echo("  Ask questions or type /decide when ready")
-                        console.print(f"  [{COLORS['muted']}]Quick: /status  /menu  /advise  /resources  /llm[/{COLORS['muted']}]")
+                        console.print(f"  [{COLORS['muted']}]Quick: /status  /menu  /advise  /resources  /intel  /llm[/{COLORS['muted']}]")
                         typer.echo("")
                         console.print(f"[{COLORS['muted']}]" + "─" * 79 + f"[/{COLORS['muted']}]")
-                else:
-                    console.print("[bold red]Invalid selection[/bold red]")
-                continue
-
-            if user_input.lower() in ["/status", "status"]:
-                typer.echo("")
-                
-                if RICH_ENABLED:
-                    # Display based on play mode
-                    if play_mode == "classic":
-                        # Show metrics table (includes turn, phase, influence)
-                        console.print(metrics_table(world))
-                    elif play_mode == "immersive":
-                        # Show vibes
-                        typer.echo("═" * 60)
-                        typer.echo("SITUATION ASSESSMENT")
-                        typer.echo("═" * 60)
-                        typer.echo("")
-                        vibes = narrative_state.get_situation_vibes()
-                        for vibe in vibes:
-                            typer.echo(vibe.to_string())
-                        typer.echo("")
-                        
-                        # Show character attitudes
-                        typer.echo("═" * 60)
-                        typer.echo("ADVISOR ATTITUDES")
-                        typer.echo("═" * 60)
-                        typer.echo("")
-                        for char_id, char_attitude in narrative_state.characters.items():
-                            trust_level = char_attitude.trust // 20
-                            trust_bar = "█" * trust_level + "░" * (5 - trust_level)
-                            relationship_symbol = {
-                                "allied": "✓",
-                                "neutral": "○",
-                                "hostile": "✗",
-                                "unknown": "?"
-                            }.get(char_attitude.relationship, "○")
-                            typer.echo(f"{char_attitude.name:<30} {trust_bar} {relationship_symbol} {char_attitude.relationship.upper()}")
-                    elif play_mode == "emergent":
-                        # Show narrative summary
-                        typer.echo("═" * 60)
-                        typer.echo(narrative_state.situation_summary)
-                        typer.echo("═" * 60)
-                    
-                    # Show active flags if any
-                    if world.flags:
-                        typer.echo("")
-                        console.print(f"[{COLORS['warning']} bold]ACTIVE RISK FLAGS:[/{COLORS['warning']} bold]")
-                        for flag, value in world.flags.items():
-                            if value:
-                                console.print(f"  [{COLORS['warning']}]{SYMBOLS['warning']} {flag.replace('_', ' ').title()}[/{COLORS['warning']}]")
-                else:
-                    # Fallback to plain text
-                    typer.echo("=" * 60)
-                    typer.echo("CURRENT SITUATION")
-                    typer.echo("=" * 60)
+                    else:
+                        console.print("=" * 79)
+                        console.print(f"[{COLORS['accent']} bold]TURN {world.turn}: DISCUSSION PHASE[/{COLORS['accent']} bold]")
+                        console.print("=" * 79)
                     typer.echo("")
-                    typer.echo(f"Turn: {world.turn}")
-                    typer.echo(f"Phase: {world.phase}")
-                    typer.echo("")
-                    typer.echo("Metrics:")
-                    typer.echo(f"  Escalation Risk:      {world.metrics.escalation_risk}/100")
-                    typer.echo(f"  Domestic Stability:   {world.metrics.domestic_stability}/100")
-                    typer.echo(f"  Alliance Cohesion:    {world.metrics.alliance_cohesion}/100")
-                    typer.echo(f"  Military Casualties:  {world.metrics.casualties_mil}")
-                    typer.echo(f"  Civilian Casualties:  {world.metrics.casualties_civ}")
-                    typer.echo("")
-                    
-                    # Calculate influence
-                    influence_raw = (world.metrics.domestic_stability + world.metrics.alliance_cohesion) / 2.0
-                    influence = int((influence_raw - 50) / 5)
-                    influence = max(-10, min(10, influence))
-                    influence_sign = "+" if influence >= 0 else ""
-                    typer.echo(f"Public Sentiment (Influence): {influence_sign}{influence}/10")
-                    typer.echo("")
-                    
-                    if world.flags:
-                        typer.echo("Active Risk Flags:")
-                        for flag, value in world.flags.items():
-                            if value:
-                                typer.echo(f"  ! {flag.replace('_', ' ').title()}")
-                        typer.echo("")
-                
-                typer.echo("")
-                continue
+                    continue
             
-            if user_input.lower().startswith("/call "):
-                # Handle diplomatic call
-                country_input = user_input[6:].strip().upper()
-                
-                # Map common names to country codes
-                country_map = {
-                    "US": "US", "USA": "US", "AMERICA": "US", "UNITED STATES": "US",
-                    "FRANCE": "France", "FRENCH": "France",
-                    "GERMANY": "Germany", "GERMAN": "Germany",
-                    "POLAND": "Poland", "POLISH": "Poland",
-                    "RUSSIA": "Russia", "RUSSIAN": "Russia",
-                    "UKRAINE": "Ukraine", "UKRAINIAN": "Ukraine",
-                    "IRELAND": "Ireland", "IRISH": "Ireland"
-                }
-                
-                country = country_map.get(country_input, country_input.capitalize())
-                
-                console.print("")
-                console.print(f"[{COLORS['success']} bold]Connecting to {country}...[/{COLORS['success']} bold]")
-                
-                # Run diplomatic encounter (with real-time printing)
-                encounter_transcript, cohesion_delta = run_diplomatic_encounter(
-                    world,
-                    country,
-                    required=False,
-                    context=None,
-                    llm_generate=generate_text,
-                    rng=rng,
-                    root_path=root,
-                    full_transcript=transcript,
-                    get_player_input=lambda prompt: typer.prompt(prompt).strip(),
-                    print_fn=typer.echo  # Print in real-time
-                )
-                
-                # Transcript already printed, just save it
-                transcript.extend(encounter_transcript)
-                
-                # Apply alliance cohesion change
-                from engine.utils import clamp, clamp_metrics
-                from engine.flags import update_world_flags
-                
-                world.metrics.alliance_cohesion = clamp(world.metrics.alliance_cohesion + cohesion_delta)
-                clamp_metrics(world.metrics)
-                update_world_flags(world)
-                
-                continue
-            
-            if user_input.lower() in ["/advise", "advise"]:
-                # Get advice from all advisors
-                typer.echo("")
-                
-                if RICH_ENABLED:
-                    # Top border
-                    box = BOX["round"]
-                    title = " COBRA ADVISORY PANEL "
-                    title_len = len(title)
-                    left_pad = (WIDTH - title_len - 2) // 2
-                    right_pad = WIDTH - title_len - left_pad - 2
-                    console.print(f"[{COLORS['accent']} bold]{box['tl']}{box['h'] * left_pad}{title}{box['h'] * right_pad}{box['tr']}[/{COLORS['accent']} bold]")
-                    typer.echo("")
-                else:
-                    typer.echo("=" * 79)
-                    typer.echo("COBRA ADVISORY PANEL")
-                    typer.echo("=" * 79)
+                if user_input.lower() in ["/menu", "menu", "/help", "help"]:
                     typer.echo("")
                 
-                typer.echo("Requesting input from all advisors on the current situation...")
-                typer.echo("")
-                
-                # Ask each advisor for their assessment
-                # Add conciseness instruction to keep responses brief
-                advisors = [
-                    ("National Security Advisor", "NSA, what's your assessment of the current situation and recommended course of action? [Please be concise - 3-4 sentences maximum]"),
-                    ("Chief of the Defence Staff", "CDS, what are our military options and constraints? [Please be concise - 3-4 sentences maximum]"),
-                    ("Foreign Secretary", "Foreign Secretary, what's the diplomatic landscape and alliance status? [Please be concise - 3-4 sentences maximum]"),
-                    ("Home Secretary", "Home Secretary, what are the domestic security concerns? [Please be concise - 3-4 sentences maximum]"),
-                    ("Attorney General", "Attorney General, what are the legal constraints and considerations? [Please be concise - 3-4 sentences maximum]")
-                ]
-                
-                for advisor_name, question in advisors:
-                    # Separator between advisors
                     if RICH_ENABLED:
-                        console.print(f"[{COLORS['muted']}]" + "─" * 79 + f"[/{COLORS['muted']}]")
+                        # Show advisor panel
+                        console.print(advisor_menu_panel())
+                        typer.echo("")
+                    
+                        # Show diplomatic contacts
+                        available_contacts = list_available_diplomatic_contacts(world, root)
+                        console.print(diplomatic_contacts_table(available_contacts))
+                        typer.echo("")
+                    
+                        # Show metrics guide
+                        console.print(metrics_guide_panel())
+                        typer.echo("")
+                    
+                        # Show commands
+                        console.print(command_menu())
+                        typer.echo("")
+                    
+                        console.print(f"[{COLORS['muted']}]NOTE: You may also ask general questions without naming a specific advisor.[/{COLORS['muted']}]")
                     else:
-                        typer.echo("─" * 79)
+                        # Fallback to plain text
+                        console.print("=" * 60)
+                        console.print(f"[{COLORS['accent']} bold]AVAILABLE ADVISORS[/{COLORS['accent']} bold]")
+                        console.print("=" * 60)
+                        typer.echo("")
+                        typer.echo("• National Security Advisor (NSA)")
+                        typer.echo("  - Intelligence assessment, strategic planning, threat analysis")
+                        typer.echo("  - Example: 'NSA, what's your assessment of Russian intentions?'")
+                        typer.echo("")
+                        typer.echo("• Chief of the Defence Staff (CDS)")
+                        typer.echo("  - Military operations, force readiness, deployment options")
+                        typer.echo("  - Example: 'CDS, what are our air defence capabilities?'")
+                        typer.echo("")
+                        typer.echo("• Foreign Secretary")
+                        typer.echo("  - Diplomacy, alliance management, NATO coordination")
+                        typer.echo("  - Example: 'Foreign Secretary, can we count on US support?'")
+                        typer.echo("")
+                        typer.echo("• Home Secretary")
+                        typer.echo("  - Domestic security, civil protection, public messaging")
+                        typer.echo("  - Example: 'Home Secretary, how do we reassure the public?'")
+                        typer.echo("")
+                        typer.echo("• Attorney General")
+                        typer.echo("  - Legal framework, international law, rules of engagement")
+                        typer.echo("  - Example: 'Attorney General, what are our legal constraints?'")
+                        typer.echo("")
+                        console.print("=" * 60)
+                        console.print(f"[{COLORS['success']} bold]DIPLOMATIC CONTACTS[/{COLORS['success']} bold]")
+                        console.print("=" * 60)
+                        typer.echo("")
                     
-                    console.print(f"  [{COLORS['secondary']} bold]{advisor_name.upper()}[/{COLORS['secondary']} bold]")
-                    typer.echo("")
-                    
-                    # Get response from this advisor
-                    discussion_lines = run_turn_discussion(world, scenario, [question], rng, root, transcript)
-                    for line in discussion_lines:
-                        # Skip the "Prime Minister:" echo and strip the conciseness instruction
-                        if not line.startswith("Prime Minister:"):
-                            # Remove the [Please be concise...] instruction from display
-                            display_line = line.replace("[Please be concise - 3-4 sentences maximum]", "").strip()
-                            if display_line:  # Only display non-empty lines
-                                # Format response with structure
-                                if ":" in display_line:
-                                    advisor_role, rest = display_line.split(":", 1)
-                                    if RICH_ENABLED:
-                                        formatted = format_advisor_response("", rest)
-                                        console.print(formatted)
-                                    else:
-                                        console.print(f"[{COLORS['secondary']} bold]{advisor_role}:[/{COLORS['secondary']} bold]", end="")
-                                        console.print(rest)
+                        # List available diplomatic contacts
+                        available_contacts = list_available_diplomatic_contacts(world, root)
+                        if available_contacts:
+                            for country, access_level, title in available_contacts:
+                                if access_level == "leader":
+                                    console.print(f"[{COLORS['warning']} bold]  * LEADER[/{COLORS['warning']} bold] - {country}: {title}")
                                 else:
-                                    typer.echo(display_line)
+                                    console.print(f"  • Diplomat - {country}: {title}")
+                                console.print(f"    Command: /call {country.lower()}")
+                                typer.echo("")
                         else:
-                            # For transcript, clean up the question
-                            clean_line = line.replace("[Please be concise - 3-4 sentences maximum]", "").strip()
-                            transcript.append(clean_line)
-                            continue
-                    # Only add non-question lines to transcript (questions already added above)
-                    transcript.extend([l for l in discussion_lines if not l.startswith("Prime Minister:")])
-                    typer.echo("")
+                            typer.echo("  No diplomatic contacts available (Alliance Cohesion too low)")
+                            typer.echo("")
+                    
+                        console.print("=" * 60)
+                        console.print(f"[{COLORS['warning']} bold]METRICS GUIDE[/{COLORS['warning']} bold]")
+                        console.print("=" * 60)
+                        typer.echo("")
+                        typer.echo("• Escalation Risk (0-100)")
+                        typer.echo("  Likelihood of conflict escalating to full-scale war")
+                        typer.echo("  HIGH = Danger of Russian attack or nuclear exchange")
+                        typer.echo("")
+                        typer.echo("• Domestic Stability (0-100)")
+                        typer.echo("  Public confidence, economic stability, infrastructure security")
+                        typer.echo("  LOW = Civil unrest, panic, political pressure")
+                        typer.echo("")
+                        typer.echo("• Alliance Cohesion (0-100)")
+                        typer.echo("  Strength of NATO solidarity and allied support")
+                        typer.echo("  HIGH = Access to leaders, Article 5 support likely")
+                        typer.echo("  LOW = Isolated, limited diplomatic access")
+                        typer.echo("")
+                        typer.echo("• Influence (-10 to +10)")
+                        typer.echo("  Your political capital and public sentiment")
+                        typer.echo("  Derived from: (Stability + Cohesion) / 2")
+                        typer.echo("  Currently: Informational only (future: affects options)")
+                        typer.echo("")
+                        console.print("=" * 60)
+                        console.print(f"[{COLORS['accent']} bold]COMMANDS[/{COLORS['accent']} bold]")
+                        console.print("=" * 60)
+                        console.print("")
+                        console.print(f"[{COLORS['primary']}]  /menu or /help[/{COLORS['primary']}]     - Show this menu")
+                        console.print(f"[{COLORS['primary']}]  /status[/{COLORS['primary']}]            - Show current metrics and situation")
+                        console.print(f"[{COLORS['primary']}]  /advise[/{COLORS['primary']}]            - Get input from all advisors at once")
+                        console.print(f"[{COLORS['primary']}]  /resources[/{COLORS['primary']}]         - Show UK forces and ammunition stockpiles")
+                        console.print(f"[{COLORS['primary']}]  /intel[/{COLORS['primary']}]             - Intelligence briefing on foreign actors")
+                        console.print(f"[{COLORS['primary']}]  /call <country>[/{COLORS['primary']}]    - Contact a foreign leader or diplomat")
+                        console.print(f"[{COLORS['primary']}]  /decide[/{COLORS['primary']}]            - Make your decision")
+                        console.print(f"[{COLORS['primary']}]  /theme[/{COLORS['primary']}]             - Change UI theme")
+                        console.print(f"[{COLORS['primary']}]  /llm[/{COLORS['primary']}]               - Configure LLM model settings")
+                        console.print(f"[{COLORS['primary']}]  /save[/{COLORS['primary']}]              - Save game and continue")
+                        console.print(f"[{COLORS['primary']}]  /quit[/{COLORS['primary']}]              - Exit game")
+                        typer.echo("")
+                        console.print(f"[{COLORS['muted']}]NOTE: You may also ask general questions without naming a specific advisor.[/{COLORS['muted']}]")
                 
-                if RICH_ENABLED:
-                    # Bottom border
-                    console.print(f"[{COLORS['accent']} bold]{box['bl']}{box['h'] * (WIDTH - 2)}{box['br']}[/{COLORS['accent']} bold]")
-                else:
-                    typer.echo("=" * 79)
-                
-                typer.echo("")
-                continue
-            
-            if user_input.lower() in ["/resources", "resources"]:
-                # Display UK forces and stockpiles
-                initial_conditions = load_initial_conditions(scenario, root)
-                
-                typer.echo("")
-                
-                if RICH_ENABLED:
-                    forces_table, stockpiles_table = resources_tables(initial_conditions)
-                    console.print(forces_table)
-                    typer.echo("")
-                    console.print(stockpiles_table)
                     typer.echo("")
                     continue
-                
-                # Fallback to plain text
-                typer.echo("=" * 79)
-                typer.echo("UK MILITARY RESOURCES")
-                typer.echo("=" * 79)
-                typer.echo("")
-                
-                # Display stockpiles
-                stockpiles = initial_conditions.get("stockpiles", {})
-                if stockpiles:
-                    typer.echo("AMMUNITION STOCKPILES:")
+
+                # Unknown slash-command: tell the player instead of sending it
+                # to the advisors as an in-fiction question (a paid LLM call)
+                if user_input.startswith("/"):
+                    console.print(f"[{COLORS['warning']}]Unknown command: {rich_escape(user_input.split()[0])} — type /menu for the command list.[/{COLORS['warning']}]")
                     typer.echo("")
-                    
-                    # Air Defence
-                    air_defence = stockpiles.get("air_defence_missiles", {})
-                    if air_defence:
-                        typer.echo("  Air Defence:")
-                        for weapon, data in air_defence.items():
-                            count = data.get("count", 0)
-                            note = data.get("note", "")
-                            typer.echo(f"    • {weapon.replace('_', ' ').title()}: {count}")
-                            if note:
-                                typer.echo(f"      {note}")
-                        typer.echo("")
-                    
-                    # Naval Strike
-                    typer.echo("  Naval Strike:")
-                    tomahawk = stockpiles.get("tomahawk_cruise_missiles", {})
-                    if tomahawk:
-                        typer.echo(f"    • Tomahawk Cruise Missiles: {tomahawk.get('count', 0)}")
-                        typer.echo(f"      {tomahawk.get('note', '')}")
-                    harpoon = stockpiles.get("harpoon_anti_ship", {})
-                    if harpoon:
-                        typer.echo(f"    • Harpoon Anti-Ship: {harpoon.get('count', 0)}")
-                        typer.echo(f"      {harpoon.get('note', '')}")
-                    typer.echo("")
-                    
-                    # Air-Launched
-                    typer.echo("  Air-Launched Precision:")
-                    storm_shadow = stockpiles.get("storm_shadow_cruise_missiles", {})
-                    if storm_shadow:
-                        typer.echo(f"    • Storm Shadow: {storm_shadow.get('count', 0)}")
-                        typer.echo(f"      {storm_shadow.get('note', '')}")
-                    paveway = stockpiles.get("paveway_laser_guided_bombs", {})
-                    if paveway:
-                        typer.echo(f"    • Paveway LGBs: {paveway.get('count', 0)}")
-                        typer.echo(f"      {paveway.get('note', '')}")
-                    typer.echo("")
-                    
-                    # Anti-Submarine
-                    typer.echo("  Anti-Submarine:")
-                    spearfish = stockpiles.get("spearfish_torpedoes", {})
-                    if spearfish:
-                        typer.echo(f"    • Spearfish Torpedoes: {spearfish.get('count', 0)}")
-                        typer.echo(f"      {spearfish.get('note', '')}")
-                    stingray = stockpiles.get("stingray_lightweight_torpedoes", {})
-                    if stingray:
-                        typer.echo(f"    • Stingray Torpedoes: {stingray.get('count', 0)}")
-                        typer.echo(f"      {stingray.get('note', '')}")
-                    typer.echo("")
-                
-                # Display forces
-                uk_forces = initial_conditions.get("uk_forces", {})
-                if uk_forces:
-                    naval = uk_forces.get("naval", [])
-                    if naval:
-                        typer.echo("NAVAL FORCES:")
-                        typer.echo("")
-                        for unit in naval:
-                            unit_id = unit.get("id", "Unknown")
-                            unit_type = unit.get("type", "")
-                            location = unit.get("location", "")
-                            status = unit.get("status", "")
-                            typer.echo(f"  • {unit_id} ({unit_type})")
-                            typer.echo(f"    Location: {location}")
-                            typer.echo(f"    Status: {status}")
-                            if unit.get("note"):
-                                typer.echo(f"    Note: {unit.get('note')}")
-                            typer.echo("")
-                    
-                    air = uk_forces.get("air", [])
-                    if air:
-                        typer.echo("AIR FORCES:")
-                        typer.echo("")
-                        for unit in air:
-                            unit_id = unit.get("id", "Unknown")
-                            unit_type = unit.get("type", "")
-                            location = unit.get("location", "")
-                            status = unit.get("status", "")
-                            
-                            # Display unit header
-                            typer.echo(f"  • {unit_id}")
-                            
-                            # Show type and role
-                            if unit_type:
-                                role = unit.get("role", "")
-                                if role:
-                                    typer.echo(f"    Type: {unit_type} ({role})")
-                                else:
-                                    typer.echo(f"    Type: {unit_type}")
-                            
-                            # Show location if present
-                            if location:
-                                typer.echo(f"    Location: {location}")
-                            
-                            # Show aircraft counts if present
-                            aircraft_count = unit.get("aircraft_count")
-                            operational_aircraft = unit.get("operational_aircraft")
-                            if aircraft_count is not None:
-                                if operational_aircraft is not None:
-                                    typer.echo(f"    Aircraft: {operational_aircraft}/{aircraft_count} operational")
-                                else:
-                                    typer.echo(f"    Aircraft: {aircraft_count}")
-                            
-                            # Show status
-                            typer.echo(f"    Status: {status}")
-                            
-                            # Show note if present
-                            if unit.get("note"):
-                                typer.echo(f"    Note: {unit.get('note')}")
-                            
-                            typer.echo("")
-                
-                typer.echo("=" * 79)
-                typer.echo("")
-                continue
+                    continue
+
+                # Handle question
+                questions.append(user_input)
+                discussion_lines = run_turn_discussion(world, scenario, [user_input], rng, root, transcript)
             
-            if user_input.lower().startswith("/intel"):
-                # Intelligence command - detailed actor assessment
-                typer.echo("")
-                
-                # Parse command: /intel or /intel <country_code>
-                parts = user_input.lower().split()
-                if len(parts) == 1:
-                    # Show available actors
-                    if world.actor_system:
-                        typer.echo("Available countries for intelligence assessment:")
-                        typer.echo("")
-                        for code, actor in world.actor_system.actors.items():
-                            typer.echo(f"  /intel {code.lower()} - {actor.full_name}")
-                        typer.echo("")
-                    else:
-                        typer.echo("Intelligence system not available.")
-                else:
-                    # Show detailed assessment for specific actor
-                    country_code = parts[1].upper()
-                    if world.actor_system:
-                        from engine.intelligence import generate_actor_detailed_assessment
-                        intel_lines = generate_actor_detailed_assessment(country_code, world, world.turn)
-                        for line in intel_lines:
-                            console.print(line)
-                    else:
-                        typer.echo("Intelligence system not available.")
-                
-                typer.echo("")
-                continue
+                typer.echo("")  # Space before response
             
-            if user_input.lower() in ["/llm", "llm", "/settings", "settings"]:
-                # Open LLM model settings menu
-                typer.echo("")
-                typer.echo("Opening LLM Model Settings...")
-                typer.echo("")
-                model_settings_menu()
-                # After returning from settings, clear and redisplay the discussion phase
-                typer.clear()
-                typer.echo("")
                 if RICH_ENABLED:
-                    console.print(phase_header("DISCUSSION", world.turn))
-                    typer.echo("")
-                    typer.echo("  Ask questions or type /decide when ready")
-                    console.print(f"  [{COLORS['muted']}]Quick: /status  /menu  /advise  /resources  /intel  /llm[/{COLORS['muted']}]")
-                    typer.echo("")
                     console.print(f"[{COLORS['muted']}]" + "─" * 79 + f"[/{COLORS['muted']}]")
-                else:
-                    console.print("=" * 79)
-                    console.print(f"[{COLORS['accent']} bold]TURN {world.turn}: DISCUSSION PHASE[/{COLORS['accent']} bold]")
-                    console.print("=" * 79)
-                typer.echo("")
-                continue
+                    typer.echo("")
             
-            if user_input.lower() in ["/menu", "menu", "/help", "help"]:
-                typer.echo("")
-                
-                if RICH_ENABLED:
-                    # Show advisor panel
-                    console.print(advisor_menu_panel())
-                    typer.echo("")
-                    
-                    # Show diplomatic contacts
-                    available_contacts = list_available_diplomatic_contacts(world, root)
-                    console.print(diplomatic_contacts_table(available_contacts))
-                    typer.echo("")
-                    
-                    # Show metrics guide
-                    console.print(metrics_guide_panel())
-                    typer.echo("")
-                    
-                    # Show commands
-                    console.print(command_menu())
-                    typer.echo("")
-                    
-                    console.print(f"[{COLORS['muted']}]NOTE: You may also ask general questions without naming a specific advisor.[/{COLORS['muted']}]")
-                else:
-                    # Fallback to plain text
-                    console.print("=" * 60)
-                    console.print(f"[{COLORS['accent']} bold]AVAILABLE ADVISORS[/{COLORS['accent']} bold]")
-                    console.print("=" * 60)
-                    typer.echo("")
-                    typer.echo("• National Security Advisor (NSA)")
-                    typer.echo("  - Intelligence assessment, strategic planning, threat analysis")
-                    typer.echo("  - Example: 'NSA, what's your assessment of Russian intentions?'")
-                    typer.echo("")
-                    typer.echo("• Chief of the Defence Staff (CDS)")
-                    typer.echo("  - Military operations, force readiness, deployment options")
-                    typer.echo("  - Example: 'CDS, what are our air defence capabilities?'")
-                    typer.echo("")
-                    typer.echo("• Foreign Secretary")
-                    typer.echo("  - Diplomacy, alliance management, NATO coordination")
-                    typer.echo("  - Example: 'Foreign Secretary, can we count on US support?'")
-                    typer.echo("")
-                    typer.echo("• Home Secretary")
-                    typer.echo("  - Domestic security, civil protection, public messaging")
-                    typer.echo("  - Example: 'Home Secretary, how do we reassure the public?'")
-                    typer.echo("")
-                    typer.echo("• Attorney General")
-                    typer.echo("  - Legal framework, international law, rules of engagement")
-                    typer.echo("  - Example: 'Attorney General, what are our legal constraints?'")
-                    typer.echo("")
-                    console.print("=" * 60)
-                    console.print(f"[{COLORS['success']} bold]DIPLOMATIC CONTACTS[/{COLORS['success']} bold]")
-                    console.print("=" * 60)
-                    typer.echo("")
-                    
-                    # List available diplomatic contacts
-                    available_contacts = list_available_diplomatic_contacts(world, root)
-                    if available_contacts:
-                        for country, access_level, title in available_contacts:
-                            if access_level == "leader":
-                                console.print(f"[{COLORS['warning']} bold]  * LEADER[/{COLORS['warning']} bold] - {country}: {title}")
-                            else:
-                                console.print(f"  • Diplomat - {country}: {title}")
-                            console.print(f"    Command: /call {country.lower()}")
+                for line in discussion_lines:
+                    # Skip echoing the player's question (they just typed it)
+                    if not line.startswith("Prime Minister:"):
+                        if ":" in line:
+                            advisor_name, rest = line.split(":", 1)
+                        
+                            # Print advisor name
+                            console.print(f"  [{COLORS['secondary']} bold]{advisor_name}[/{COLORS['secondary']} bold]")
                             typer.echo("")
-                    else:
-                        typer.echo("  No diplomatic contacts available (Alliance Cohesion too low)")
-                        typer.echo("")
-                    
-                    console.print("=" * 60)
-                    console.print(f"[{COLORS['warning']} bold]METRICS GUIDE[/{COLORS['warning']} bold]")
-                    console.print("=" * 60)
-                    typer.echo("")
-                    typer.echo("• Escalation Risk (0-100)")
-                    typer.echo("  Likelihood of conflict escalating to full-scale war")
-                    typer.echo("  HIGH = Danger of Russian attack or nuclear exchange")
-                    typer.echo("")
-                    typer.echo("• Domestic Stability (0-100)")
-                    typer.echo("  Public confidence, economic stability, infrastructure security")
-                    typer.echo("  LOW = Civil unrest, panic, political pressure")
-                    typer.echo("")
-                    typer.echo("• Alliance Cohesion (0-100)")
-                    typer.echo("  Strength of NATO solidarity and allied support")
-                    typer.echo("  HIGH = Access to leaders, Article 5 support likely")
-                    typer.echo("  LOW = Isolated, limited diplomatic access")
-                    typer.echo("")
-                    typer.echo("• Influence (-10 to +10)")
-                    typer.echo("  Your political capital and public sentiment")
-                    typer.echo("  Derived from: (Stability + Cohesion) / 2")
-                    typer.echo("  Currently: Informational only (future: affects options)")
-                    typer.echo("")
-                    console.print("=" * 60)
-                    console.print(f"[{COLORS['accent']} bold]COMMANDS[/{COLORS['accent']} bold]")
-                    console.print("=" * 60)
-                    console.print("")
-                    console.print(f"[{COLORS['primary']}]  /menu or /help[/{COLORS['primary']}]     - Show this menu")
-                    console.print(f"[{COLORS['primary']}]  /status[/{COLORS['primary']}]            - Show current metrics and situation")
-                    console.print(f"[{COLORS['primary']}]  /advise[/{COLORS['primary']}]            - Get input from all advisors at once")
-                    console.print(f"[{COLORS['primary']}]  /resources[/{COLORS['primary']}]         - Show UK forces and ammunition stockpiles")
-                    console.print(f"[{COLORS['primary']}]  /call <country>[/{COLORS['primary']}]    - Contact a foreign leader or diplomat")
-                    console.print(f"[{COLORS['primary']}]  /decide[/{COLORS['primary']}]            - Make your decision")
-                    console.print(f"[{COLORS['primary']}]  /theme[/{COLORS['primary']}]             - Change UI theme")
-                    console.print(f"[{COLORS['primary']}]  /save[/{COLORS['primary']}]              - Save game and continue")
-                    console.print(f"[{COLORS['primary']}]  /quit[/{COLORS['primary']}]              - Exit game")
-                    typer.echo("")
-                    console.print(f"[{COLORS['muted']}]NOTE: You may also ask general questions without naming a specific advisor.[/{COLORS['muted']}]")
-                
-                typer.echo("")
-                continue
-            
-            # Handle question
-            questions.append(user_input)
-            discussion_lines = run_turn_discussion(world, scenario, [user_input], rng, root, transcript)
-            
-            typer.echo("")  # Space before response
-            
-            if RICH_ENABLED:
-                console.print(f"[{COLORS['muted']}]" + "─" * 79 + f"[/{COLORS['muted']}]")
-                typer.echo("")
-            
-            for line in discussion_lines:
-                # Skip echoing the player's question (they just typed it)
-                if not line.startswith("Prime Minister:"):
-                    if ":" in line:
-                        advisor_name, rest = line.split(":", 1)
                         
-                        # Print advisor name
-                        console.print(f"  [{COLORS['secondary']} bold]{advisor_name}[/{COLORS['secondary']} bold]")
-                        typer.echo("")
-                        
-                        # Format response with structure
-                        if RICH_ENABLED:
-                            formatted = format_advisor_response("", rest)
-                            console.print(formatted)
+                            # Format response with structure
+                            if RICH_ENABLED:
+                                formatted = format_advisor_response("", rest)
+                                console.print(formatted)
+                            else:
+                                typer.echo(rest)
                         else:
-                            typer.echo(rest)
-                    else:
-                        typer.echo(line)
+                            typer.echo(line)
             
-            transcript.extend(discussion_lines)
+                transcript.extend(discussion_lines)
             
-            typer.echo("")  # Space after response
+                typer.echo("")  # Space after response
             
-            if RICH_ENABLED:
-                console.print(f"[{COLORS['muted']}]" + "─" * 79 + f"[/{COLORS['muted']}]")
+                if RICH_ENABLED:
+                    console.print(f"[{COLORS['muted']}]" + "─" * 79 + f"[/{COLORS['muted']}]")
             
-            typer.echo("")
+                typer.echo("")
         
-        # Decision phase loop - allows returning to discussion if decision is cancelled
-        decision_confirmed = False
-        while not decision_confirmed:
-            # Decision phase - clear screen and start at top
-            typer.clear()
-            typer.echo("")  # Buffer line
+            # Decision phase loop - allows returning to discussion if decision is cancelled
+            decision_confirmed = False
+            while not decision_confirmed:
+                # Decision phase - clear screen and start at top
+                typer.clear()
+                typer.echo("")  # Buffer line
             
-            if RICH_ENABLED:
-                console.print(phase_header("DECISION", world.turn))
-                typer.echo("")
-                typer.echo("  Enter your decision (or 'cancel' to return to discussion)")
-            else:
-                console.print("=" * 79)
-                console.print(f"[{COLORS['emphasis']} bold]TURN {world.turn}: DECISION PHASE[/{COLORS['emphasis']} bold]")
-                console.print("=" * 79)
-                console.print("")
-                console.print("Enter your decision (or 'cancel' to return to discussion):")
-            
-            typer.echo("")
-            
-            action = typer.prompt("Decision>").strip()
-            
-            if action.lower() == "cancel":
-                # Return to discussion phase
-                break
-            
-            if not action:
-                typer.echo("No action entered. Returning to discussion.")
-                typer.echo("")
-                wait_for_space("Press SPACE to return to discussion...")
-                break
-            
-            # Interpret and get pushback
-            interpretation, pushback, critical_concerns, decision_lines = run_turn_decision(world, scenario, action, rng, root, transcript)
-            transcript.extend(decision_lines)
-            
-            # Display decision with improved UX
-            display_decision_summary(action, interpretation, show_details=False)
-            
-            # Option to see full details
-            see_details = typer.prompt("", default="").strip().lower()
-            if see_details == "details":
-                display_decision_summary(action, interpretation, show_details=True)
-                console.print("")
-            
-            # Handle critical omissions with selective addressing
-            if critical_concerns:
-                action_code, selected_indices = display_critical_concerns_with_selection(critical_concerns)
-                
-                if action_code == 'D':
-                    # Return to discussion
+                if RICH_ENABLED:
+                    console.print(phase_header("DECISION", world.turn))
                     typer.echo("")
-                    typer.echo("Returning to discussion phase.")
-                    typer.echo("")
-                    wait_for_space("Press SPACE to return to discussion...")
+                    typer.echo("  Enter your decision (or 'cancel' to return to discussion)")
+                else:
+                    console.print("=" * 79)
+                    console.print(f"[{COLORS['emphasis']} bold]TURN {world.turn}: DECISION PHASE[/{COLORS['emphasis']} bold]")
+                    console.print("=" * 79)
+                    console.print("")
+                    console.print("Enter your decision (or 'cancel' to return to discussion):")
+            
+                typer.echo("")
+            
+                action = typer.prompt("Decision>").strip()
+            
+                if action.lower() == "cancel":
+                    # Return to discussion phase
                     break
-                
-                elif action_code == 'M':
-                    # Modify manually
+            
+                if not action:
+                    typer.echo("No action entered. Returning to discussion.")
                     typer.echo("")
-                    typer.echo("Decision cancelled. Please enter a modified decision.")
-                    typer.echo("")
-                    continue
+                    wait_for_space("Press SPACE (or Enter) to return to discussion...")
+                    break
+            
+                # Interpret and get pushback
+                interpretation, pushback, critical_concerns, decision_lines = run_turn_decision(world, scenario, action, rng, root, transcript)
+                transcript.extend(decision_lines)
+            
+                # Display decision with improved UX
+                display_decision_summary(action, interpretation, show_details=False)
+            
+                # Option to see full details
+                see_details = typer.prompt("", default="").strip().lower()
+                if see_details == "details":
+                    display_decision_summary(action, interpretation, show_details=True)
+                    console.print("")
+            
+                # Handle critical omissions with selective addressing
+                if critical_concerns:
+                    action_code, selected_indices = display_critical_concerns_with_selection(critical_concerns)
                 
-                elif action_code in ['A', 'S'] and selected_indices:
-                    # Apply selected recommendations
-                    console.print("")
-                    console.print(f"[{COLORS['success']}]Applying {len(selected_indices)} recommendation(s)...[/{COLORS['success']}]")
-                    console.print("")
-                    
-                    # Append recommendations
-                    enhanced_decision = append_recommendations_to_decision(action, critical_concerns, selected_indices)
-                    
-                    # Show enhanced decision
-                    console.print(Panel(f"[italic]{enhanced_decision}[/italic]", title="[bold]ENHANCED DECISION[/bold]", border_style="white"))
-                    console.print("")
-                    
-                    # Confirm
-                    confirm = typer.confirm("Proceed with enhanced decision?", default=True)
-                    
-                    if not confirm:
-                        console.print("")
-                        console.print("Decision cancelled.")
-                        console.print("")
+                    if action_code == 'D':
+                        # Return to discussion
+                        typer.echo("")
+                        typer.echo("Returning to discussion phase.")
+                        typer.echo("")
+                        wait_for_space("Press SPACE (or Enter) to return to discussion...")
+                        break
+                
+                    elif action_code == 'M':
+                        # Modify manually
+                        typer.echo("")
+                        typer.echo("Decision cancelled. Please enter a modified decision.")
+                        typer.echo("")
                         continue
-                    
-                    # Update action for adjudication
-                    action = enhanced_decision
-                    
-                    # Re-interpret
-                    console.print("")
-                    console.print("Re-interpreting enhanced decision...")
-                    console.print("")
-                    
-                    interpretation, pushback, critical_concerns_2, decision_lines_2 = run_turn_decision(world, scenario, action, rng, root, transcript)
-                    transcript.extend(decision_lines_2)
-                    
-                    # Display new interpretation
-                    display_decision_summary(action, interpretation, show_details=False)
-                    
-                    # If STILL have concerns, warn
-                    if critical_concerns_2:
+                
+                    elif action_code in ['A', 'S'] and selected_indices:
+                        # Apply selected recommendations
                         console.print("")
-                        console.print(f"[{COLORS['warning']}]⚠ Warning: Critical concerns remain.[/{COLORS['warning']}]")
+                        console.print(f"[{COLORS['success']}]Applying {len(selected_indices)} recommendation(s)...[/{COLORS['success']}]")
                         console.print("")
-                        # Let player proceed or go back
-                        cont = typer.confirm("Proceed anyway?", default=False)
-                        if not cont:
+                    
+                        # Append recommendations
+                        enhanced_decision = append_recommendations_to_decision(action, critical_concerns, selected_indices)
+                    
+                        # Show enhanced decision
+                        console.print(Panel(f"[italic]{rich_escape(enhanced_decision)}[/italic]", title="[bold]ENHANCED DECISION[/bold]", border_style="white"))
+                        console.print("")
+                    
+                        # Confirm
+                        confirm = typer.confirm("Proceed with enhanced decision?", default=True)
+                    
+                        if not confirm:
+                            console.print("")
+                            console.print("Decision cancelled.")
+                            console.print("")
                             continue
                     
-                    decision_confirmed = True
+                        # Update action for adjudication
+                        action = enhanced_decision
+                    
+                        # Re-interpret
+                        console.print("")
+                        console.print("Re-interpreting enhanced decision...")
+                        console.print("")
+                    
+                        interpretation, pushback, critical_concerns_2, decision_lines_2 = run_turn_decision(world, scenario, action, rng, root, transcript)
+                        transcript.extend(decision_lines_2)
+                    
+                        # Display new interpretation
+                        display_decision_summary(action, interpretation, show_details=False)
+                    
+                        # If STILL have concerns, warn
+                        if critical_concerns_2:
+                            console.print("")
+                            console.print(f"[{COLORS['warning']}]⚠ Warning: Critical concerns remain.[/{COLORS['warning']}]")
+                            console.print("")
+                            # Let player proceed or go back
+                            cont = typer.confirm("Proceed anyway?", default=False)
+                            if not cont:
+                                continue
+                    
+                        decision_confirmed = True
                 
-                else:  # 'I' - Ignore
-                    typer.echo("")
-                    typer.echo(f"[{COLORS['warning']}]Proceeding despite all concerns...[/{COLORS['warning']}]")
-                    typer.echo("")
-                    decision_confirmed = True
+                    else:  # 'I' - Ignore
+                        typer.echo("")
+                        typer.echo(f"[{COLORS['warning']}]Proceeding despite all concerns...[/{COLORS['warning']}]")
+                        typer.echo("")
+                        decision_confirmed = True
             
-            # Confirm decision (regular pushback, if any)
-            elif pushback:
-                typer.echo("")
-                confirm = typer.confirm("Proceed with this decision despite concerns?", default=True)
-                if not confirm:
+                # Confirm decision (regular pushback, if any)
+                elif pushback:
                     typer.echo("")
-                    typer.echo("Decision cancelled. Returning to discussion.")
-                    typer.echo("")
-                    wait_for_space("Press SPACE to return to discussion...")
-                    break  # Break inner loop, return to discussion
+                    confirm = typer.confirm("Proceed with this decision despite concerns?", default=True)
+                    if not confirm:
+                        typer.echo("")
+                        typer.echo("Decision cancelled. Returning to discussion.")
+                        typer.echo("")
+                        wait_for_space("Press SPACE (or Enter) to return to discussion...")
+                        break  # Break inner loop, return to discussion
+                    else:
+                        decision_confirmed = True  # Proceed to adjudication
                 else:
-                    decision_confirmed = True  # Proceed to adjudication
-            else:
-                decision_confirmed = True  # No pushback, proceed to adjudication
+                    decision_confirmed = True  # No pushback, proceed to adjudication
         
-        # If decision was cancelled, go back to discussion phase
-        if not decision_confirmed:
-            continue
         
         # Adjudication phase - clear screen and start at top
         typer.clear()
@@ -1746,87 +1815,17 @@ def play(
                     world_narrative=world.narrative
                 )
             
-            # Display quality reasoning
-            typer.echo("")
-            if RICH_ENABLED:
-                console.print(Panel(format_markdown(reasoning), title=f"[{COLORS['accent']} bold]ACTION ASSESSMENT[/]", border_style=COLORS['accent']))
-            else:
-                typer.echo("=" * 60)
-                typer.echo("ACTION ASSESSMENT")
-                typer.echo("=" * 60)
-                typer.echo("")
-                typer.echo(reasoning)
-            typer.echo("")
-            
-            # Display effects
-            if RICH_ENABLED:
-                console.print(f"[{COLORS['accent']} bold]EFFECTS[/]")
-                console.print(f"[{COLORS['accent']}]" + "═" * 60 + f"[/{COLORS['accent']}]")
-            else:
-                typer.echo("=" * 60)
-                typer.echo("EFFECTS")
-                typer.echo("=" * 60)
-            typer.echo("")
-            
-            for metric, delta in final_effects.items():
-                if RICH_ENABLED:
-                    color = COLORS['success'] if delta > 0 else COLORS['danger'] if delta < 0 else COLORS['muted']
-                    console.print(f"  [{color}]{metric}: {delta:+d}[/{color}]")
-                else:
-                    typer.echo(f"  {metric}: {delta:+d}")
-            typer.echo("")
-            
-            # Display character responses
-            if character_responses:
-                if RICH_ENABLED:
-                    console.print(f"[{COLORS['accent']} bold]ADVISOR REACTIONS[/]")
-                    console.print(f"[{COLORS['accent']}]" + "═" * 60 + f"[/{COLORS['accent']}]")
-                else:
-                    typer.echo("=" * 60)
-                    typer.echo("ADVISOR REACTIONS")
-                    typer.echo("=" * 60)
-                typer.echo("")
-                
-                for char_name, response in character_responses:
-                    if RICH_ENABLED:
-                        console.print(f"[{COLORS['secondary']} bold]{char_name}:[/{COLORS['secondary']} bold]")
-                        console.print(f"  \"{response}\"")
-                    else:
-                        typer.echo(f"{char_name}:")
-                        typer.echo(f"  \"{response}\"")
-                    typer.echo("")
-            
-            # Display international reactions (multi-agent simulation)
-            if actor_responses:
-                if RICH_ENABLED:
-                    console.print(f"[{COLORS['accent']} bold]INTERNATIONAL REACTIONS[/]")
-                    console.print(f"[{COLORS['accent']}]" + "═" * 60 + f"[/{COLORS['accent']}]")
-                else:
-                    typer.echo("=" * 60)
-                    typer.echo("INTERNATIONAL REACTIONS")
-                    typer.echo("=" * 60)
-                typer.echo("")
-                
-                for response in actor_responses:
-                    trust_delta = response.trust_change
-                    actor_id = response.actor_id
-                    
-                    # Get full name if available
-                    actor_name = actor_id
-                    if world.actor_system:
-                        actor = world.actor_system.get_actor(actor_id)
-                        if actor:
-                            actor_name = actor.full_name
-                    
-                    if RICH_ENABLED:
-                        color = COLORS['success'] if trust_delta > 0 else COLORS['danger'] if trust_delta < 0 else COLORS['muted']
-                        console.print(f"[{COLORS['primary']} bold]{actor_name}:[/{COLORS['primary']} bold] [{color}]({trust_delta:+d})[/{color}]")
-                        console.print(f"  \"{response.public_response}\"")
-                    else:
-                        typer.echo(f"{actor_name}: ({trust_delta:+d})")
-                        typer.echo(f"  \"{response.public_response}\"")
-                    typer.echo("")
-            
+            # Display adjudication results (shared with the dashboard CLI)
+            display_adjudication_results(
+                COLORS,
+                play_mode,
+                reasoning,
+                final_effects,
+                character_responses,
+                actor_responses,
+                world,
+            )
+
             # Sync world metrics with narrative state (keep both in sync)
             world.metrics.escalation_risk = narrative_state.hidden_metrics.escalation_risk
             world.metrics.domestic_stability = narrative_state.hidden_metrics.domestic_stability
@@ -1931,23 +1930,60 @@ def play(
             typer.echo("═" * 60)
             typer.echo("")
         
-        # Auto-save after each turn
-        save_path = save_game(world, transcript, scenario, "autosave", root, play_mode, narrative_state)
-        
-        # Advance turn
+        # Classic mode has the win/lose thresholds its menu screen promises.
+        # Immersive and emergent modes are open-ended by design.
+        ending = None
+        if play_mode == "classic" and not endings_disabled:
+            ending = check_ending(world, final_turn=campaign_final_turn)
+
+        # Advance turn BEFORE autosaving: a save taken pre-increment resumed
+        # into the just-finished turn, replaying its briefing and re-applying
+        # inject effects on top of the saved metrics.
         world.turn += 1
         world.scene = world.turn  # Keep scene in sync for legacy compatibility
         world.discussion_transcript = []
-        
+        world.phase = "briefing"
+
+        save_path = save_game(world, transcript, scenario, "autosave", root, play_mode, narrative_state, variant=variant, initial_metrics=initial_metrics_snapshot)
+
+        if ending:
+            debrief_lines = build_debrief_lines(world, ending, initial_metrics_snapshot, transcript)
+            transcript.extend(debrief_lines)
+            typer.echo("")
+            if RICH_ENABLED:
+                verdict_color = {
+                    "victory": COLORS["success"],
+                    "partial": COLORS["warning"],
+                    "defeat": COLORS["danger"],
+                }.get(ending.verdict, COLORS["normal"])
+                console.print(Panel(
+                    "\n".join(rich_escape(line) for line in debrief_lines[4:]),
+                    title=f"[{verdict_color} bold]{rich_escape(ending.title)}[/{verdict_color} bold]",
+                    subtitle=f"[{verdict_color}]{ending.verdict.upper()} — {world.turn - 1} turns[/{verdict_color}]",
+                    border_style=verdict_color,
+                ))
+            else:
+                for line in debrief_lines:
+                    typer.echo(line)
+            typer.echo("")
+
+            if typer.confirm("Continue playing open-ended (no further win/lose checks)?", default=False):
+                endings_disabled = True
+                typer.echo("")
+            else:
+                typer.echo("")
+                typer.echo(f"Final state saved to {save_path.name}. Thank you for playing.")
+                break
+
         typer.echo("")
         typer.echo("=" * 60)
         typer.echo(f"Turn {world.turn - 1} complete. Auto-saved to {save_path.name}")
         typer.echo("=" * 60)
         typer.echo("")
-        
+
         # Continue to next turn with spacebar
         try:
-            wait_for_space("Press SPACE to continue to next turn (or Ctrl+C to exit)...")
+            wait_for_space("Press SPACE (or Enter) to continue to next turn (or Ctrl+C to exit)...")
         except KeyboardInterrupt:
             typer.echo("\nGame paused. Use --load to resume.")
             break

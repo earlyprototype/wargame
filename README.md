@@ -30,6 +30,8 @@ Here's a full first turn, start to finish:
 
 ## Quickstart
 
+**Windows (PowerShell):**
+
 ```powershell
 git clone https://github.com/earlyprototype/false-flag.git
 cd false-flag
@@ -43,7 +45,19 @@ $env:PYTHONIOENCODING = "utf-8"
 .\.venv\Scripts\python.exe -m cli.main play
 ```
 
-No API key and no config file needed. With nothing configured, the game defaults to a deterministic **mock** advisor mode, so you get the full turn structure — briefing, cabinet Q&A, decision, adjudication — without calling out to any LLM provider. On first launch you'll be asked to pick a scenario length, difficulty, and play mode; the defaults are sensible, so pressing Enter through them is fine.
+**Linux / macOS:**
+
+```bash
+git clone https://github.com/earlyprototype/false-flag.git
+cd false-flag
+
+python3 -m venv .venv
+.venv/bin/pip install -r requirements.txt
+
+.venv/bin/python -m cli.main play
+```
+
+No API key and no config file needed. With nothing configured, the game defaults to a deterministic **mock** advisor mode, so you get the full turn structure — briefing, cabinet Q&A, decision, adjudication — without calling out to any LLM provider. On first launch you'll be asked to pick a scenario, play mode, difficulty, and game type; each menu has a sensible default, so pressing Enter through them is fine.
 
 ### Real AI advisors (recommended for actual play)
 
@@ -70,6 +84,8 @@ During gameplay, you can use:
 - **Get Advice**: `NSA, what's Russia's likely next move?`
 - **Check Status**: `/status` - View metrics and situation
 - **View Menu**: `/menu` - See available advisors and commands
+- **Intelligence**: `/intel` - Briefing on foreign actors
+- **Diplomacy**: `/call <country>` - Phone a foreign leader
 - **Make Decision**: `/decide` - Commit to your action
 - **Save Game**: `/save` - Save progress
 - **Quit**: `/quit` - Exit game
@@ -102,12 +118,17 @@ Prime Minister, what is your decision?
 
 ### Metrics
 
-Your decisions affect four key metrics:
+Your decisions affect three key metrics (visible as numbers in Classic mode,
+as narrative "vibes" in Immersive/Emergent modes), plus a casualty count:
 
-- **Mission Progress** (0-100): How close you are to resolving the crisis
 - **Escalation Risk** (0-100): Danger of conflict escalation
 - **Domestic Stability** (0-100): Public confidence and infrastructure security
 - **Alliance Cohesion** (0-100): NATO unity and US commitment
+
+In **Classic mode**, the crisis has win/lose thresholds: escalation hitting 100,
+stability or cohesion collapsing to 0 ends the campaign, and surviving to the
+end of the scenario produces a graded resolution. Immersive and Emergent modes
+are open-ended by design — the story continues as long as you keep playing.
 
 ### Advisor Pushback
 
