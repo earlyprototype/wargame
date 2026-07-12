@@ -200,10 +200,14 @@ def apply_inject_effects(world: WorldState, inject: Dict[str, Any], silent: bool
                 delta_value = None
         
         # Apply difficulty multiplier to scenario effects (not casualties).
-        # round(), not int(): truncation turned every ±1 scripted effect into
-        # a no-op on the 0.5x and 0.7x difficulties.
-        if delta_value is not None and metric_name not in ["casualties_civ", "casualties_mil"]:
-            delta_value = round(delta_value * difficulty_multiplier)
+        # A non-zero scripted effect always keeps at least magnitude 1:
+        # int() truncated ±1 effects to no-ops on 0.5x/0.7x, and round()
+        # alone still zeroes ±1 at 0.5x (banker's rounding: round(0.5) == 0).
+        if delta_value is not None and delta_value != 0 and metric_name not in ["casualties_civ", "casualties_mil"]:
+            scaled = round(delta_value * difficulty_multiplier)
+            if scaled == 0:
+                scaled = 1 if delta_value > 0 else -1
+            delta_value = scaled
 
         if isinstance(metric_name, str) and delta_value is not None:
             # Update the targeted metric

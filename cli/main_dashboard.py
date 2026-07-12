@@ -1292,17 +1292,18 @@ def play(
                         for advisor_name, question in advisors:
                             advisor_responses.append(f"[{COLORS['secondary']} bold]{advisor_name.upper()}[/{COLORS['secondary']} bold]")
 
-                            # Show spinner while LLM processes
+                            # Show spinner while LLM processes (the body layout
+                            # only has "sidebar" and "main" nodes)
                             from rich.spinner import Spinner
                             spinner = Spinner("dots", text=f"Connecting to {advisor_name}...", style=COLORS['muted'])
-                            dashboard.layout["body"]["conversation"].update(spinner)
+                            dashboard.layout["body"]["main"].update(spinner)
                             live.refresh()
 
                             # Get response from this advisor
                             discussion_lines = run_turn_discussion(world, scenario, [question], rng, root, transcript)
 
                             # Clear spinner
-                            dashboard.layout["body"]["conversation"].update(dashboard._build_conversation())
+                            dashboard.layout["body"]["main"].update(dashboard.render_main())
                             for line in discussion_lines:
                                 if not line.startswith("Prime Minister:"):
                                     display_line = line.replace("[Please be concise - 3-4 sentences maximum]", "").strip()
