@@ -55,8 +55,9 @@ def render_screen(console: Console, title: str, content: str, pause_text: str = 
         stream: If True, stream text character by character
     """
     import time
-    import msvcrt
-    
+
+    from cli.keyboard import key_pressed
+
     colors = get_defcon_colors()
     
     # Clear screen first
@@ -97,11 +98,10 @@ def render_screen(console: Console, title: str, content: str, pause_text: str = 
         with Live(get_panel(""), console=console, refresh_per_second=20, transient=True) as live:
             for char in content:
                 # Allow skip
-                if msvcrt.kbhit():
-                    if msvcrt.getch() == b' ':
-                        current_text = content
-                        live.update(get_panel(current_text))
-                        break
+                if key_pressed():
+                    current_text = content
+                    live.update(get_panel(current_text))
+                    break
                 
                 current_text += char
                 live.update(get_panel(current_text))

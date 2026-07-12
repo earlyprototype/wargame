@@ -14,13 +14,11 @@ from typing import Optional
 import sys
 import os
 
-# CRITICAL: Import msvcrt FIRST on Windows (before Rich)
-if sys.platform == "win32":
-    pass
-
 # Allow running this file directly
 if __package__ is None or __package__ == "":
     sys.path.append(os.path.dirname(os.path.dirname(__file__)))
+
+from cli.keyboard import key_pressed, wait_for_key
 
 # THEN import Rich (after msvcrt is loaded)
 from cli.rich_ui import (
@@ -70,21 +68,15 @@ def scroll_text(text: str, delay: float = 0.03, allow_skip: bool = True) -> bool
     Returns:
         True if user pressed SPACE to skip, False otherwise
     """
-    import msvcrt
-    import sys
-    
     for i, char in enumerate(text):
         # Check if user pressed SPACE to skip rest of scene
-        if allow_skip and msvcrt.kbhit():
-            key = msvcrt.getch()
-            if key == b' ':  # Spacebar
-                # Print rest of line and return skip signal
-                sys.stdout.write(text[i:])
-                sys.stdout.flush()
-                print()
-                return True  # Signal to skip rest of scene
-            # Ignore other keys, continue scrolling
-        
+        if allow_skip and key_pressed():
+            # Print rest of line and return skip signal
+            sys.stdout.write(text[i:])
+            sys.stdout.flush()
+            print()
+            return True  # Signal to skip rest of scene
+
         sys.stdout.write(char)
         sys.stdout.flush()
         
@@ -104,16 +96,8 @@ def scroll_text(text: str, delay: float = 0.03, allow_skip: bool = True) -> bool
 
 
 def wait_for_space(prompt: str = "Press SPACE to continue...") -> None:
-    """Wait for user to press spacebar to continue."""
-    import msvcrt  # Windows-specific
-    typer.echo("")
-    typer.echo(prompt)
-    while True:
-        if msvcrt.kbhit():
-            key = msvcrt.getch()
-            if key == b' ':  # Spacebar
-                typer.echo("")
-                break
+    """Wait for the player to press spacebar (cross-platform)."""
+    wait_for_key(prompt)
 
 
 def strip_effect_boxes(lines: list) -> list:
